@@ -857,6 +857,32 @@ void Interpreter::Run() {
                 cursor.pos = entry;
                 break;
             }
+            // Namespaced-calls blueprint step 3: calls through a
+            // previously-evaluated FunctionRef value (step 1) instead of an
+            // embedded bytecode operand — same frame-push mechanics as
+            // OP_ScriptFunctionCall, just reading the target from the
+            // popped stack value (which must be on TOP at this point; the
+            // compiler emits the function-pointer-producing expression
+            // LAST, after all args, to guarantee this). Deliberately NOT
+            // implementing OP_ScriptThreadCallPointer/method-pointer
+            // variants here — see the blueprint's own step 3 context brief
+            // for why (no thread dispatch exists to model on, thread calls
+            // are asynchronous by nature, method variants need the
+            // deferred entity model).
+            case KisakScriptOpcode::OP_ScriptFunctionCallPointer: {
+                if (stack.empty()) { RuntimeError("OP_ScriptFunctionCallPointer stack underflow"); return; }
+                KisakScriptValue target = pop();
+                if (target.type != KisakScriptValueType::FunctionRef) {
+                    RuntimeError("value is not a function pointer (" + target.Describe() + ")");
+                    return;
+                }
+                if (frames.size() >= 32) { RuntimeError("script stack overflow"); return; }
+                Frame callee;
+                callee.returnPos = cursor.pos;
+                frames.push_back(std::move(callee));
+                cursor.pos = target.functionEntryOffset;
+                break;
+            }
             case KisakScriptOpcode::OP_Return: {
                 KisakScriptValue ret = pop();
                 while (top().type != KisakScriptValueType::CodePos) {

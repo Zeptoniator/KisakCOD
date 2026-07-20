@@ -29,9 +29,28 @@
 //    the name is a function defined elsewhere in the SAME program, it compiles
 //    to an OP_ScriptFunctionCall whose 4-byte codepos operand is backpatched
 //    once every function's entry offset is known (functions can be
-//    forward-referenced). Anything else is a compile error — there is no
-//    cross-file linker in this step, so an unresolved name is genuinely
-//    uncompilable, not something to invent a stub for.
+//    forward-referenced). Otherwise (namespaced-calls blueprint step 3), if
+//    the name is a currently-declared LOCAL variable, it may hold a FunctionRef
+//    at runtime (assigned from a bare `::func` reference, step 2) — compiled
+//    to OP_ScriptFunctionCallPointer, which reads its target from a popped
+//    stack value instead of an embedded operand. This is a deliberate,
+//    documented SIMPLIFICATION beyond real GSC: retail only allows calling
+//    through an arbitrary value via the separate `[[ expr ]](...)` syntax
+//    (confirmed out of scope — not in the real corpus), never via bare
+//    `name()`; this port instead lets bare `name()` resolve to a local
+//    holding a function pointer as a third tier, so a stored `::func`
+//    reference can actually be invoked without implementing bracket-pointer
+//    syntax. Anything else is a compile error — there is no cross-file
+//    linker in this step, so an unresolved name is genuinely uncompilable,
+//    not something to invent a stub for.
+//
+// 3. NamespacedCallExpr/FunctionRefExpr WITH AN EMPTY PATH (step 2's bare
+//    `::func`/`::func(...)` forms, no filename prefix) are same-file by
+//    definition and resolve via the SAME tiers as an ordinary CallExpr/
+//    IdentifierExpr — see EmitNamespacedCall/EmitFunctionRef below. A
+//    NON-empty path is cross-file, out of scope until step 5's cross-file
+//    model exists — a specific, clearly-labeled compile error for now, not
+//    a silent misresolution.
 
 namespace {
 
@@ -252,6 +271,8 @@ struct Compiler {
             case Kind::BinaryExpr: return EmitBinary(n);
             case Kind::UnaryExpr: return EmitUnary(n);
             case Kind::CallExpr: return EmitCall(n);
+            case Kind::NamespacedCallExpr: return EmitNamespacedCall(n);
+            case Kind::FunctionRefExpr: return EmitFunctionRef(n);
             case Kind::MethodCallExpr:
                 Error(n.line, "method call '" + n.text + "' needs an entity/object model: " +
                               std::string(kEntityDeferred));
@@ -412,10 +433,81 @@ struct Compiler {
             callFixups.push_back({at, n.text, curFunction ? *curFunction : "", n.line});
             return true;
         }
+        if (locals.Has(n.text)) {
+            // Step 3's third tier: call through a local variable that may
+            // hold a FunctionRef at runtime (see decision #2 above for why
+            // bare `name()` is allowed to mean this — a deliberate
+            // simplification, not real GSC's `[[ expr ]]` syntax). Args
+            // LEFT-TO-RIGHT same as a direct script call, then the
+            // function-pointer expression is evaluated LAST so its value
+            // is on TOP of stack when OP_ScriptFunctionCallPointer pops it.
+            EmitOp(Op::OP_PreScriptCall);
+            for (uint32_t i = 0; i < argc; ++i) {
+                if (n.children[i]) EmitExpression(*n.children[i]);
+                else { EmitOp(Op::OP_GetUndefined); }
+            }
+            EmitEvalLocal(locals.Cached(n.text));
+            EmitOp(Op::OP_ScriptFunctionCallPointer);
+            return true;
+        }
         Error(n.line, "unknown function/builtin: '" + n.text +
-                      "' (no builtin by that name and no function so-named in this program; "
+                      "' (no builtin by that name, no function so-named in this program, "
+                      "and no local variable by that name to call through; "
                       "there is no cross-file linking in this step)");
         return true;
+    }
+
+    // Step 2's bare-`::func`/`::func(...)` forms (empty stringList, no
+    // filename) are same-file by construction — resolve exactly like an
+    // ordinary call. EmitCall only reads n.text/n.children, not n.kind, so
+    // it works unchanged for a NamespacedCallExpr node too. A non-empty
+    // path is cross-file, out of scope until step 5.
+    bool EmitNamespacedCall(const KisakAstNode& n) {
+        if (!n.stringList.empty()) {
+            Error(n.line, "namespaced call '" +
+                          JoinPath(n.stringList) + "::" + n.text +
+                          "(...)' needs cross-file resolution: not supported until "
+                          "step 5 of plans/android-gscript-namespaced-calls.md");
+            return true;
+        }
+        return EmitCall(n);
+    }
+
+    // Step 2's bare `::func` value-reference form (FunctionRefExpr). Empty
+    // path = same-file: resolve via the SAME same-file/forward-reference
+    // backpatch mechanism a same-file CallExpr already gets (CallFixup is
+    // generic over "a 4-byte codepos operand pointing at a same-Program
+    // function" — it doesn't care whether the opcode before it was
+    // OP_ScriptFunctionCall or OP_GetFunction). Non-empty path = cross-file,
+    // out of scope until step 5.
+    bool EmitFunctionRef(const KisakAstNode& n) {
+        if (!n.stringList.empty()) {
+            Error(n.line, "function reference '" +
+                          JoinPath(n.stringList) + "::" + n.text +
+                          "' needs cross-file resolution: not supported until "
+                          "step 5 of plans/android-gscript-namespaced-calls.md");
+            return true;
+        }
+        if (!functionNames.count(n.text)) {
+            Error(n.line, "unknown function: '::" + n.text +
+                          "' (no function so-named in this program; there is no "
+                          "cross-file linking in this step)");
+            return true;
+        }
+        EmitOp(Op::OP_GetFunction);
+        size_t at = here();
+        EmitU32(0);
+        callFixups.push_back({at, n.text, curFunction ? *curFunction : "", n.line});
+        return true;
+    }
+
+    static std::string JoinPath(const std::vector<std::string>& segments) {
+        std::string out;
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (i) out += "\\";
+            out += segments[i];
+        }
+        return out;
     }
 
     // ---- statement emission ----
