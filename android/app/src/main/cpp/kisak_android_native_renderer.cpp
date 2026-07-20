@@ -1799,8 +1799,11 @@ void DrawWorldScene(GlContext& gl) {
         int currentLightmap = -2;
         int currentBlendPair = -1;
         // Brush and terrain surfaces wind in opposite directions in the raw
-        // data (the D3D path flips cull mode per pass); until that split is
-        // ported, world geometry draws double-sided.
+        // data (confirmed again on-device: applying the same per-material
+        // cullNone bits static models use turns the ground and several
+        // walls inside-out — the D3D path evidently flips cull mode per
+        // pass in a way this port doesn't replicate). Until that split is
+        // actually ported, world geometry stays double-sided.
         glDisable(GL_CULL_FACE);
         for (const WorldDrawRun& run : gl.worldRuns) {
             if (run.sky || run.blended != blendedPhase) {
