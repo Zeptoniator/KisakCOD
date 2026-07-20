@@ -714,41 +714,48 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
         scene.viewmodelSurfaces = mesh.surfaces;
         scene.hasViewmodel = true;
         scene.viewmodelWeaponName = zone.weapons[w];
+        break; // first usable weapon only — no loadout system yet
+    }
 
-        // Fire sound: fireSoundPlayer (WeaponDef) -> alias name -> the
-        // alias's first in-memory clip -> that clip's own bytes in
-        // zone.loadedSounds. Falls back to the plain fireSound ("_npc"/
-        // world-heard variant) when the player alias isn't in THIS zone's
-        // own directory — per-map zones don't necessarily bundle every
-        // alias the weapon references, some live in a shared code zone this
-        // port doesn't load for gameplay. Only WAVE_FORMAT_PCM (format 1),
-        // 8- or 16-bit, is decoded — this port has no ADPCM decoder, and
-        // the actual format value is logged either way.
-        const auto findAlias = [&](const std::string& name) -> const KisakLoadedSoundAlias* {
-            for (const KisakLoadedSoundAlias& candidate : zone.soundAliases) {
-                // Cross-zone shared asset references serialize with a
-                // leading comma in this engine's convention (same as
-                // techset/image names elsewhere in this port) — an alias
-                // list that's just a placeholder shell for another zone's
-                // real definition, not local audio data.
-                const std::string& candidateName = candidate.name;
-                const bool matches = candidateName == name
-                    || (!candidateName.empty() && candidateName.front() == ','
-                        && candidateName.compare(1, std::string::npos, name) == 0);
-                if (matches) {
-                    return &candidate;
-                }
+    // Fire sound: fireSoundPlayer (WeaponDef) -> alias name -> the alias's
+    // first in-memory clip or streamed path. Falls back to the plain
+    // fireSound ("_npc"/world-heard variant) when the player alias isn't in
+    // THIS zone's own directory — per-map zones don't necessarily bundle
+    // every alias the weapon references. Searches EVERY weapon (not just
+    // the viewmodel's) and stops at the first one that actually resolves —
+    // some weapons' fire sound entries are themselves empty placeholders in
+    // the retail data (seen on killhouse's winchester1200), so trying only
+    // the displayed weapon would silently stay mute even when the zone has
+    // other, working, fire sounds. Only WAVE_FORMAT_PCM (format 1), 8- or
+    // 16-bit, is decoded — this port has no ADPCM decoder.
+    const auto findAlias = [&](const std::string& name) -> const KisakLoadedSoundAlias* {
+        for (const KisakLoadedSoundAlias& candidate : zone.soundAliases) {
+            // Cross-zone shared asset references serialize with a leading
+            // comma in this engine's convention (same as techset/image
+            // names elsewhere in this port) — an alias list that's just a
+            // placeholder shell for another zone's real definition.
+            const std::string& candidateName = candidate.name;
+            const bool matches = candidateName == name
+                || (!candidateName.empty() && candidateName.front() == ','
+                    && candidateName.compare(1, std::string::npos, name) == 0);
+            if (matches) {
+                return &candidate;
             }
-            return nullptr;
-        };
-        const auto findClip = [&](const std::string& name) -> const KisakLoadedSound* {
-            for (const KisakLoadedSound& candidate : zone.loadedSounds) {
-                if (candidate.name == name) {
-                    return &candidate;
-                }
+        }
+        return nullptr;
+    };
+    const auto findClip = [&](const std::string& name) -> const KisakLoadedSound* {
+        for (const KisakLoadedSound& candidate : zone.loadedSounds) {
+            if (candidate.name == name) {
+                return &candidate;
             }
-            return nullptr;
-        };
+        }
+        return nullptr;
+    };
+    for (size_t w = 0; w < zone.weapons.size(); ++w) {
+        if (zone.weapons[w] == "none") {
+            continue;
+        }
         std::string fireSoundName;
         if (w < zone.weaponFireSoundNames.size() && !zone.weaponFireSoundNames[w].empty()) {
             fireSoundName = zone.weaponFireSoundNames[w];
@@ -759,10 +766,11 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
             fireSoundName = zone.weaponFireSoundNpcNames[w];
             alias = findAlias(fireSoundName);
         }
+        if (alias == nullptr) {
+            continue;
+        }
         const KisakLoadedSound* clip =
-            (alias != nullptr && !alias->loadedSoundNames.empty())
-                ? findClip(alias->loadedSoundNames.front())
-                : nullptr;
+            !alias->loadedSoundNames.empty() ? findClip(alias->loadedSoundNames.front()) : nullptr;
         if (clip != nullptr && clip->format == 1 && clip->channels > 0 && clip->rate > 0
             && !clip->data.empty()) {
             if (clip->bits == 16) {
@@ -782,34 +790,25 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
             if (scene.hasFireSound) {
                 scene.fireSoundChannels = clip->channels;
                 scene.fireSoundRate = static_cast<int>(clip->rate);
+                scene.fireSoundWeaponName = zone.weapons[w];
+                scene.fireSoundDiagnostic =
+                    "arme=" + zone.weapons[w] + " clip=" + clip->name
+                    + " rate=" + std::to_string(clip->rate) + " channels=" + std::to_string(clip->channels);
+                break;
             }
-        }
-        if (clip != nullptr) {
-            scene.fireSoundDiagnostic =
-                "clip=" + clip->name + " format=" + std::to_string(clip->format)
-                + " bits=" + std::to_string(clip->bits) + " rate=" + std::to_string(clip->rate)
-                + " channels=" + std::to_string(clip->channels)
-                + " bytes=" + std::to_string(clip->data.size());
-        } else if (alias != nullptr && !alias->streamedSoundPaths.empty()) {
-            // Streamed variant (the common case for SP weapon fire sounds —
-            // a real .wav on the VFS, not embedded inline). Reading and
-            // parsing happens in InitWorldScene, same as world textures; the
-            // scene builder just hands over the path.
+        } else if (!alias->streamedSoundPaths.empty()) {
             scene.fireSoundStreamedPath = alias->streamedSoundPaths.front();
-            scene.fireSoundDiagnostic = "flux='" + scene.fireSoundStreamedPath + "'";
-        } else if (alias != nullptr) {
-            std::string variantNames;
-            for (const std::string& n : alias->loadedSoundNames) {
-                variantNames += (variantNames.empty() ? "" : ",") + n;
-            }
-            scene.fireSoundDiagnostic = "alias '" + alias->name + "' trouve, aliasCount="
-                + std::to_string(alias->aliasCount) + " loadedSoundNames=["
-                + (variantNames.empty() ? "(vide)" : variantNames) + "]";
-        } else if (!fireSoundName.empty()) {
-            scene.fireSoundDiagnostic = "alias '" + fireSoundName + "' introuvable parmi "
-                + std::to_string(zone.soundAliases.size()) + " alias de cette zone";
+            scene.fireSoundWeaponName = zone.weapons[w];
+            scene.fireSoundDiagnostic =
+                "arme=" + zone.weapons[w] + " flux='" + scene.fireSoundStreamedPath + "'";
+            break;
         }
-        break; // first usable weapon only — no loadout system yet
+        // Alias found but its variant has neither a clip nor a streamed
+        // path (an empty placeholder in the retail data) — try the next
+        // weapon instead of giving up on audio entirely.
+    }
+    if (scene.fireSoundDiagnostic.empty()) {
+        scene.fireSoundDiagnostic = "aucune arme de cette zone n'a de son de tir resoluble";
     }
 
     // Spawn point from the map_ents entity string. map_ents rarely has its

@@ -137,6 +137,7 @@ struct KisakWorldScene {
     // Fire sound (see kisak_audio_android.h): interleaved PCM16, already
     // converted from whatever bit depth the zone's LoadedSound clip used.
     bool hasFireSound = false;
+    std::string fireSoundWeaponName; // which weapon's fire sound this is — can differ from viewmodelWeaponName
     std::vector<int16_t> fireSoundSamples;
     int fireSoundChannels = 1;
     int fireSoundRate = 22050;
