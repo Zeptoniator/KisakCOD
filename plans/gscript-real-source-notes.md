@@ -476,3 +476,82 @@ Step 3's actual VM semantics, not assumed):
 No VM gaps needed fixing in Step 3/4's files — every construct in the
 supported subset (everything except self/level/game/field-access) mapped
 cleanly onto already-implemented opcodes.
+
+## Addendum — Step 9 findings (device wiring)
+
+Source: `plans/android-gscript-vm-port.md`, Step 9 — the plan's second hard
+join point (needs steps 4+5+8) and the step that actually changes
+observable game behavior.
+
+Design decisions (matching the context brief's own default): the
+script-driven path is **opt-in/parallel, not a replacement** —
+`ParseModelEntities`/`BuildWorldScene` are completely untouched;
+`CompileAndRunScript` is a pure diagnostic added to `StartWorldLoad`
+(`kisak_android_native_renderer.cpp`) right where step 1's rawfile scan
+already runs, reusing the SAME `rawFiles`/`zoneData` already in scope. The
+`.gsc` content is sliced directly from the already-decompressed zone
+buffer via `KisakZoneRawFile::contentOffset`/`length` — the exact same
+slice `DumpZoneRawFiles` already uses to write files to disk (already
+validated in step 1), so there was no risk of an off-by-one on the
+content bytes.
+
+**Real device confirmation: the real map's own `.gsc` cannot execute past
+its first genuinely out-of-grammar construct, and it's earlier than
+step 8 predicted.** Step 8 expected `killhouse.gsc`'s `main()` to fail at
+its self/level field access (`level.short_training = true;`, line 9) —
+but that's a COMPILER-stage rejection, and the PARSER (step 7) happily
+builds a `FieldAccessExpr` for `level.short_training` (parsing succeeds
+structurally; only the compiler complains). Parsing therefore continues
+past line 9 and fails instead at line 27's `default_start( ::inside_start
+);` — a bare `::inside_start` function-pointer literal, which step 7
+never gave ANY grammar production (function pointers were on the
+explicitly-deferred list). This is a genuine, real device confirmation
+(not a bug): `unexpected operator '::' in expression`, a clean parse
+error, zero crash.
+
+Because of this, the required "concrete evidence of script execution"
+(exit criteria) comes from a **hand-written self-test script**
+(`kStep9SelfTestScript`, explicitly labeled as hand-written, not extracted
+— same precedent as step 8), run through the identical `CompileGscSource`
++ `KisakScriptVm::Execute` pipeline, on the SAME device pass as the real
+script's rejection. Device log (killhouse, 2026-07-20):
+
+```
+Step9 script print: step9 selftest sum=15
+Step9 script 'killhouse (selftest)': compile OK (77 octets), main() -> Completed, entites spawnees=1
+Step9 script 'maps/killhouse.gsc': COMPILATION ECHOUEE (1 erreurs): parse: line 27: unexpected operator '::' in expression
+```
+
+`sum=15` matches a manual trace of the self-test's loop exactly (see the
+script's own source). One bug caught and fixed in the self-test script
+BEFORE it ever reached the device: it originally used `"" + sum` /
+`"prefix" + sum` (string+int concatenation via the `+` operator) — but
+`RunPlus` (step 3) only implements string+string or numeric+numeric, not
+mixed; string+int silently routes into `CastNumericPair` and fails with a
+runtime error. Fixed by using `setdvar`/`print`'s own per-argument
+`AsString()` conversion instead (pass `sum` as a separate Int argument,
+not string-concatenated) — caught by a host test before ever touching a
+device build.
+
+**New `spawn` builtin** (index 11, appended — every earlier index stays
+stable for already-compiled bytecode): `spawn(classname, x, y, z)`. Real
+GSC's `spawn(classname, origin)` takes a vector literal; this trimmed
+grammar has no vector-literal syntax (step 7 never parses `(x, y, z)` as
+a 3-component literal — ambiguous with a parenthesized sub-expression
+without comma-counting lookahead), so origin is 3 separate numeric args
+instead. Builds a `KisakScriptEntity` (step 5) and returns an opaque Int
+handle (its index in a run-scoped list) — still no entity value type in
+`KisakScriptValue`, so a script can hold the handle but can't call methods
+or access fields on it (the same deferred entity-model gap as step 8).
+The spawned-entity list is a plain global
+(`ResetKisakScriptSpawnedEntities`/`GetKisakScriptSpawnedEntities`),
+matching this codebase's established pattern for builtin-adjacent shared
+state (the menu dvar store) — `KisakScriptBuiltinFn` is a plain function
+pointer with no per-call capture, so a global is the only option without
+widening every existing builtin's signature. Device-confirmed: the
+self-test's one `spawn("script_model", 12, 34, 56)` call produced
+`entites spawnees=1` in the log.
+
+World rendered with zero regression on the same device pass (killhouse:
+255 static models / 12225 instances / 8694 surfaces, matching every prior
+session's baseline exactly), crash buffer empty throughout.

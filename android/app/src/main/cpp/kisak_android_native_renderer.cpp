@@ -6,6 +6,8 @@
 #include "kisak_iwi_texture_android.h"
 #include "kisak_menu_scene_android.h"
 #include "kisak_menu_state_android.h"
+#include "kisak_script_compiler_android.h"
+#include "kisak_script_vm_android.h"
 #include "kisak_world_scene_android.h"
 #include "kisak_zone_rawfile_android.h"
 
@@ -838,6 +840,89 @@ std::string LaunchCommandMapName(const std::string& command) {
     return mapName;
 }
 
+// GScript blueprint (plans/android-gscript-vm-port.md) step 9: a trimmed
+// Scr_LoadLevel-equivalent (G_InitGame -> Scr_InitSystem -> Scr_LoadLevel ->
+// load maps/<mapname>.gsc's main label -> Scr_ExecThread). Compiles+runs one
+// already-extracted .gsc source string via steps 6/7/8/3/4's pipeline and
+// logs the outcome — purely diagnostic, does not feed `scene`/entityModels/
+// rendering in any way (opt-in/parallel per the plan's own context brief;
+// ParseModelEntities stays the one live entity path until step 10 decides
+// otherwise after real device validation).
+void CompileAndRunScript(const std::string& label, const std::string& source) {
+    KisakScriptCompileResult compiled = CompileGscSource(source);
+    if (!compiled.errors.empty()) {
+        std::string msg;
+        for (size_t i = 0; i < compiled.errors.size() && i < 5; ++i) {
+            if (i) msg += " | ";
+            msg += compiled.errors[i];
+        }
+        __android_log_print(ANDROID_LOG_WARN, kLogTag,
+            "Step9 script '%s': COMPILATION ECHOUEE (%zu erreurs): %s",
+            label.c_str(), compiled.errors.size(), msg.c_str());
+        return;
+    }
+    auto mainIt = compiled.program.functionEntryPoints.find("main");
+    if (mainIt == compiled.program.functionEntryPoints.end()) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag,
+            "Step9 script '%s': compile OK (%zu octets) mais aucune fonction main()",
+            label.c_str(), compiled.program.bytecode.size());
+        return;
+    }
+    ResetKisakScriptSpawnedEntities();
+    KisakScriptVm vm;
+    vm.logFn = [](const std::string& line) {
+        __android_log_print(ANDROID_LOG_INFO, kLogTag, "Step9 script print: %s", line.c_str());
+    };
+    KisakScriptExecResult exec = vm.Execute(compiled.program, mainIt->second);
+    const char* statusName =
+        exec.status == KisakScriptExecStatus::Completed ? "Completed" :
+        exec.status == KisakScriptExecStatus::RuntimeError ? "RuntimeError" :
+        exec.status == KisakScriptExecStatus::UnsupportedOpcode ? "UnsupportedOpcode" : "Aborted";
+    __android_log_print(
+        exec.status == KisakScriptExecStatus::Completed ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+        kLogTag,
+        "Step9 script '%s': compile OK (%zu octets), main() -> %s%s%s, entites spawnees=%zu",
+        label.c_str(), compiled.program.bytecode.size(), statusName,
+        exec.message.empty() ? "" : " msg=", exec.message.c_str(),
+        GetKisakScriptSpawnedEntities().size()
+    );
+}
+
+// Hand-written script (NOT extracted from any real .gsc file — noted
+// explicitly, matching step 8's own precedent) exercising the parts of the
+// pipeline the real level script structurally cannot reach yet: locals,
+// arithmetic, a loop, a script-to-script call, print/setdvar/getdvar, and
+// the step 9 spawn() builtin. This is the step's actual "concrete evidence
+// of script execution" proof (per the exit criteria's own wording) — the
+// real map script is expected to fail at its very first self/level field
+// reference (see the attempt on the map's own maps/<mapname>.gsc below,
+// and plans/gscript-real-source-notes.md's step 9 findings).
+const char* const kStep9SelfTestScript = R"GSC(
+addone(n)
+{
+	return n + 1;
+}
+
+main()
+{
+	sum = 0;
+	i = 0;
+	while (i < 5)
+	{
+		sum = addone(sum) + i;
+		i++;
+	}
+	// setdvar/print convert each argument via AsString() internally
+	// (kisak_script_vm_android.cpp) -- string+int concatenation via the `+`
+	// operator is deliberately NOT used here since RunPlus only implements
+	// string+string / numeric+numeric, not mixed (see step 9 findings).
+	setdvar("kisak_step9_selftest", sum);
+	print("step9 selftest sum=", sum);
+	spawn("script_model", 12, 34, 56);
+	return sum;
+}
+)GSC";
+
 // Decompresses and deserializes the map zone off the render thread, then
 // publishes the extracted world scene.
 void StartWorldLoad(const std::string& mapName) {
@@ -873,6 +958,36 @@ void StartWorldLoad(const std::string& mapName) {
                     dumpRoot.c_str(),
                     dumpErrors.empty() ? "" : (" erreurs=" + dumpErrors).c_str()
                 );
+
+                // GScript blueprint step 9: the trimmed Scr_LoadLevel-equivalent.
+                // First, a hand-written self-test (see kStep9SelfTestScript's own
+                // comment) exercising the full pipeline end to end with
+                // observable output — the real map script below is expected to
+                // fail at its very first self/level reference, so this is the
+                // step's actual "concrete evidence of script execution" proof.
+                CompileAndRunScript(mapName + " (selftest)", kStep9SelfTestScript);
+
+                // Then the real map's own main script, found by name in the
+                // same rawfile scan already used for step 1's diagnostic dump.
+                const std::string gscName = "maps/" + mapName + ".gsc";
+                bool found = false;
+                for (const KisakZoneRawFile& rf : rawFiles) {
+                    if (rf.name != gscName) continue;
+                    found = true;
+                    if (rf.contentOffset + rf.length > zoneData.size()) {
+                        __android_log_print(ANDROID_LOG_WARN, kLogTag,
+                            "Step9 script '%s': rawfile trouve mais hors bornes", gscName.c_str());
+                        break;
+                    }
+                    const std::string source(
+                        reinterpret_cast<const char*>(zoneData.data() + rf.contentOffset), rf.length);
+                    CompileAndRunScript(gscName, source);
+                    break;
+                }
+                if (!found) {
+                    __android_log_print(ANDROID_LOG_WARN, kLogTag,
+                        "Step9 script '%s': introuvable dans les rawfiles de cette zone", gscName.c_str());
+                }
             }
             const KisakZoneLoadResult zone = LoadZoneAssets(zoneData);
             zoneData.clear();

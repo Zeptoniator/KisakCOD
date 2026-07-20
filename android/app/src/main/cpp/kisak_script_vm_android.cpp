@@ -415,7 +415,46 @@ void Builtin_AssertMsg(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
     call.Fail("assert fail: " + call.args.Get(0).AsString());
 }
 
+// Run-scoped spawned-entity list — see the header comment on
+// ResetKisakScriptSpawnedEntities for why this is a plain global.
+std::vector<KisakScriptEntity> g_spawnedEntities;
+
+float NumericArg(const KisakScriptBuiltinCall& call, uint32_t index) {
+    if (!call.args.InRange(index)) return 0.0f;
+    const KisakScriptValue& v = call.args.Get(index);
+    if (v.type == KisakScriptValueType::Int) return static_cast<float>(v.i);
+    if (v.type == KisakScriptValueType::Float) return v.f;
+    return 0.0f;
+}
+
+// spawn(classname, x, y, z) — step 9. See the header comment for why origin
+// is 3 separate numeric args instead of a vector literal, and why the
+// return value is an opaque handle rather than a real entity reference.
+void Builtin_Spawn(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    if (!call.args.InRange(0) || call.args.Get(0).type != KisakScriptValueType::String) {
+        call.Fail("spawn: first argument must be a classname string");
+        return;
+    }
+    KisakScriptEntity ent;
+    ent.classname = call.args.Get(0).s;
+    ent.origin[0] = NumericArg(call, 1);
+    ent.origin[1] = NumericArg(call, 2);
+    ent.origin[2] = NumericArg(call, 3);
+    // Same classname recognition as step 5's map_ents dispatch
+    // (kisak_script_entity_android.cpp) — kept inline here rather than
+    // reused directly since that file's Build* helpers are file-local and
+    // parse a different input shape (key/value blocks vs. explicit args).
+    if (ent.classname == "script_model") ent.handler = KisakEntityHandler::ScriptModel;
+    else if (ent.classname == "trigger_multiple") ent.handler = KisakEntityHandler::TriggerMultiple;
+    int handle = static_cast<int>(g_spawnedEntities.size());
+    g_spawnedEntities.push_back(std::move(ent));
+    call.returnValue = KisakScriptValue::Int(handle);
+}
+
 }  // namespace
+
+void ResetKisakScriptSpawnedEntities() { g_spawnedEntities.clear(); }
+const std::vector<KisakScriptEntity>& GetKisakScriptSpawnedEntities() { return g_spawnedEntities; }
 
 const std::vector<KisakScriptBuiltinDef>& KisakScriptBuiltinTable() {
     static const std::vector<KisakScriptBuiltinDef> table = {
@@ -430,6 +469,7 @@ const std::vector<KisakScriptBuiltinDef>& KisakScriptBuiltinTable() {
         {"setdvar", &Builtin_SetDvar},
         {"assert", &Builtin_Assert},
         {"assertmsg", &Builtin_AssertMsg},
+        {"spawn", &Builtin_Spawn},
     };
     return table;
 }

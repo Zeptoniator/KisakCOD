@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kisak_script_entity_android.h"
+
 // GScript VM data structures — blueprint plans/android-gscript-vm-port.md,
 // step 2. Opcode enum + bytecode buffer reader primitives only: no
 // execution logic yet (that's step 3's KisakScriptVm::Execute), no
@@ -385,8 +387,29 @@ struct KisakScriptBuiltinDef {
 // Fixed table, index-stable across a build (step 8's compiler embeds these
 // indices into bytecode) — print=0, println=1, isdefined=2, isstring=3,
 // isarray=4, getdvar=5, getdvarint=6, getdvarfloat=7, setdvar=8, assert=9,
-// assertmsg=10.
+// assertmsg=10, spawn=11 (step 9). Appending spawn at the end keeps every
+// earlier index stable for already-compiled bytecode.
 const std::vector<KisakScriptBuiltinDef>& KisakScriptBuiltinTable();
 
 // -1 if no builtin has this name.
 int KisakScriptFindBuiltinIndex(const std::string& name);
+
+// ---------------------------------------------------------------------------
+// Step 9: `spawn` builtin state. A plain global, matching this codebase's
+// established pattern for builtin-adjacent shared state (the menu dvar store,
+// kisak_menu_expression_android.h) — KisakScriptBuiltinFn is a plain function
+// pointer with no per-call context/capture, so a global is the only option
+// without widening every existing builtin's signature for the sake of one.
+//
+// spawn(classname, x, y, z) — a deliberately minimal stand-in for real GSC's
+// spawn(classname, origin): this trimmed grammar has no vector-literal syntax
+// (step 7 never parses `(x, y, z)` as a 3-component literal — distinguishing
+// it from a parenthesized sub-expression needs comma-counting lookahead this
+// subset didn't build), so origin is 3 separate numeric args instead. Builds
+// a KisakScriptEntity (step 5) and returns an opaque Int handle (its index in
+// the run-scoped list) — there is still no entity value type in
+// KisakScriptValue, so a script can hold the handle or pass it around but
+// cannot call methods or access fields on it (the same deferred entity-model
+// gap step 8 already documented).
+void ResetKisakScriptSpawnedEntities();
+const std::vector<KisakScriptEntity>& GetKisakScriptSpawnedEntities();
