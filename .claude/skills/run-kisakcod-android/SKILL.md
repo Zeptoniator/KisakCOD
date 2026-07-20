@@ -91,6 +91,15 @@ turns up nothing.
 
 ## Gotchas
 
+- **`adb shell input tap` doesn't register as a tap in the world/gameplay
+  view** (menus are fine). The world's touch handling polls once per
+  rendered frame (~27-29 fps ≈ every 35ms); `input tap` synthesizes its
+  down+up pair faster than that, so the render loop only ever observes
+  the "up" and never saw an intermediate "down" to arm tap-detection
+  (e.g. hitscan fire, which needs a down-then-quick-up-without-drag). Use
+  `adb shell input swipe X Y X Y 100` instead (same start/end coords,
+  100ms duration) — it forces two distinct polled frames. A real finger
+  never taps this fast, so it's a testing-tool artifact, not an app bug.
 - **The app expects retail COD4 assets already on the device** — this repo
   and this skill don't (and shouldn't) fetch or bundle them. Before `launch`
   will show more than the bootstrap/error screen, the device needs
