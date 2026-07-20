@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <sstream>
@@ -9,6 +10,7 @@
 #include "kisak_iwi_texture_android.h"
 
 namespace {
+constexpr uint32_t kAssetTypeXModel = 0x03;
 constexpr uint32_t kAssetTypeClipMapSp = 0x0a;
 constexpr uint32_t kAssetTypeMapEnts = 0x0f;
 constexpr uint32_t kAssetTypeGfxWorld = 0x10;
@@ -61,6 +63,110 @@ uint32_t FindAssetRef(const KisakZoneLoadResult& zone, uint32_t type) {
         }
     }
     return 0;
+}
+
+// map_ents entities reference their model by name (not a pre-resolved ref
+// the way GfxWorld's own static prop instances already are) — scan the
+// zone's asset directory for an xmodel whose serialized name matches.
+uint32_t FindXModelRefByName(const KisakZoneLoadResult& zone, const KisakZoneView& view, const std::string& name) {
+    for (const auto& [assetType, ref] : zone.assetRefs) {
+        if (assetType == kAssetTypeXModel && ref != 0 && view.ValidRef(ref, 220)
+            && view.StrAt(ref, 0) == name) {
+            return ref;
+        }
+    }
+    return 0;
+}
+
+struct EntityModelSpawn {
+    std::string model;
+    float origin[3] = {0.0f, 0.0f, 0.0f};
+    float yawDegrees = 0.0f;
+    float scale = 1.0f;
+};
+
+// Same entity-string block scan as ParseSpawnPoint, but collects every
+// script_model/misc_model instead of stopping at the first spawn point —
+// these are the map's non-scripted static decoration (crates, clutter,
+// lights) that a real playthrough never interacts with, so they're safe to
+// place without any script VM.
+void ParseModelEntities(const std::string& entities, std::vector<EntityModelSpawn>& out) {
+    const auto nextQuoted = [&](size_t from, size_t end, std::string& value) -> size_t {
+        const size_t open = entities.find('"', from);
+        if (open == std::string::npos || open >= end) {
+            return std::string::npos;
+        }
+        const size_t close = entities.find('"', open + 1);
+        if (close == std::string::npos || close > end) {
+            return std::string::npos;
+        }
+        value.assign(entities, open + 1, close - open - 1);
+        return close + 1;
+    };
+    size_t cursor = 0;
+    while (true) {
+        const size_t open = entities.find('{', cursor);
+        if (open == std::string::npos) {
+            break;
+        }
+        const size_t close = entities.find('}', open);
+        if (close == std::string::npos) {
+            break;
+        }
+        cursor = close + 1;
+
+        std::string classname;
+        std::string model;
+        std::string origin;
+        std::string angles;
+        std::string modelscale;
+        size_t at = open;
+        while (at < close) {
+            std::string key;
+            std::string value;
+            at = nextQuoted(at, close, key);
+            if (at == std::string::npos) {
+                break;
+            }
+            at = nextQuoted(at, close, value);
+            if (at == std::string::npos) {
+                break;
+            }
+            if (key == "classname") {
+                classname = value;
+            } else if (key == "model") {
+                model = value;
+            } else if (key == "origin") {
+                origin = value;
+            } else if (key == "angles") {
+                angles = value;
+            } else if (key == "modelscale") {
+                modelscale = value;
+            }
+        }
+        if ((classname != "script_model" && classname != "misc_model")
+            || model.empty() || origin.empty()) {
+            continue;
+        }
+        EntityModelSpawn spawn;
+        spawn.model = model;
+        std::istringstream originIn(origin);
+        originIn >> spawn.origin[0] >> spawn.origin[1] >> spawn.origin[2];
+        if (!angles.empty()) {
+            float pitch = 0.0f;
+            float yaw = 0.0f;
+            std::istringstream anglesIn(angles);
+            anglesIn >> pitch >> yaw;
+            spawn.yawDegrees = yaw;
+        }
+        if (!modelscale.empty()) {
+            spawn.scale = static_cast<float>(atof(modelscale.c_str()));
+            if (spawn.scale <= 0.0f) {
+                spawn.scale = 1.0f;
+            }
+        }
+        out.push_back(std::move(spawn));
+    }
 }
 
 // Material -> colormap image name (semantic 2), falling back to the first
@@ -332,6 +438,80 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
         }
         return state;
     };
+
+    struct ExtractedXModelMesh {
+        std::vector<float> vertices; // 9 floats/vertex, model space: pos3 uv2 rgba4
+        std::vector<uint32_t> indices;
+        std::vector<KisakWorldDrawSurface> surfaces;
+    };
+    // XModel LOD0 -> a standalone mesh in model space (vertex/index indices
+    // start at 0, not appended to any shared pool — the caller decides where
+    // it lands). Shared by the viewmodel and map_ents prop extraction below.
+    const auto extractXModelMesh = [&](uint32_t model) -> ExtractedXModelMesh {
+        ExtractedXModelMesh mesh;
+        if (!view.ValidRef(model, 220) || static_cast<int16_t>(view.U16(model, 196)) < 1) {
+            return mesh;
+        }
+        const uint16_t numsurfs = view.U16(model, 44);
+        const uint16_t surfIndex = view.U16(model, 46);
+        const uint32_t surfs = view.U32(model, 32);
+        const uint32_t materials = view.U32(model, 36);
+        if (numsurfs == 0 || !view.ValidRef(surfs, (surfIndex + numsurfs) * 56u)) {
+            return mesh;
+        }
+        for (uint16_t s = 0; s < numsurfs; ++s) {
+            // XSurface 56o: vertCount@2, triCount@4, triIndices@12, verts0@28
+            // (GfxPackedVertex 32o: xyz@0, color@16 BGRA, texCoord@20 half).
+            const uint32_t surf = (surfIndex + s) * 56u;
+            const uint16_t vertCount = view.U16(surfs, surf + 2);
+            const uint16_t triCount = view.U16(surfs, surf + 4);
+            const uint32_t triIndices = view.U32(surfs, surf + 12);
+            const uint32_t verts0 = view.U32(surfs, surf + 28);
+            if (vertCount == 0 || triCount == 0
+                || !view.ValidRef(verts0, vertCount * 32u)
+                || !view.ValidRef(triIndices, triCount * 6u)) {
+                continue;
+            }
+            const uint32_t baseVertex = static_cast<uint32_t>(mesh.vertices.size() / 9);
+            const uint8_t* vertexData = view.Ptr(verts0);
+            for (uint32_t vertex = 0; vertex < vertCount; ++vertex) {
+                const uint8_t* packed = vertexData + static_cast<size_t>(vertex) * 32;
+                float position[3];
+                std::memcpy(position, packed, 12);
+                const uint8_t* color = packed + 16;
+                uint16_t texCoord[2];
+                std::memcpy(texCoord, packed + 20, 4);
+                mesh.vertices.insert(mesh.vertices.end(), {
+                    position[0], position[1], position[2],
+                    HalfToFloat(texCoord[0]), HalfToFloat(texCoord[1]),
+                    color[2] / 255.0f, color[1] / 255.0f, color[0] / 255.0f, color[3] / 255.0f,
+                });
+            }
+            KisakWorldDrawSurface draw;
+            draw.firstIndex = static_cast<uint32_t>(mesh.indices.size());
+            draw.indexCount = 3u * triCount;
+            uint32_t materialRef = 0;
+            if (view.ValidRef(materials, (surfIndex + s + 1u) * 4u)) {
+                materialRef = view.U32(materials, (surfIndex + s) * 4u);
+            }
+            const SurfaceState state = resolveSurfaceState(materialRef);
+            draw.textureIndex = state.textureIndex;
+            draw.alphaTestRef = state.alphaTestRef;
+            draw.blended = state.blended;
+            draw.srcBlend = state.srcBlend;
+            draw.dstBlend = state.dstBlend;
+            draw.cullNone = state.cullNone;
+            const uint8_t* localIndices = view.Ptr(triIndices);
+            for (uint32_t k = 0; k < 3u * triCount; ++k) {
+                uint16_t index = 0;
+                std::memcpy(&index, localIndices + static_cast<size_t>(k) * 2, 2);
+                mesh.indices.push_back(baseVertex + index);
+            }
+            mesh.surfaces.push_back(draw);
+        }
+        return mesh;
+    };
+
     struct PendingSurface {
         uint32_t surfaceIndex;
         int textureIndex;
@@ -525,71 +705,15 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
         if (zone.weapons[w] == "none" || w >= zone.weaponGunXModelRefs.size()) {
             continue;
         }
-        const uint32_t model = zone.weaponGunXModelRefs[w];
-        if (!view.ValidRef(model, 220) || static_cast<int16_t>(view.U16(model, 196)) < 1) {
+        const ExtractedXModelMesh mesh = extractXModelMesh(zone.weaponGunXModelRefs[w]);
+        if (mesh.surfaces.empty()) {
             continue;
         }
-        const uint16_t numsurfs = view.U16(model, 44);
-        const uint16_t surfIndex = view.U16(model, 46);
-        const uint32_t surfs = view.U32(model, 32);
-        const uint32_t materials = view.U32(model, 36);
-        if (numsurfs == 0 || !view.ValidRef(surfs, (surfIndex + numsurfs) * 56u)) {
-            continue;
-        }
-        for (uint16_t s = 0; s < numsurfs; ++s) {
-            // XSurface 56o: vertCount@2, triCount@4, triIndices@12, verts0@28
-            // (GfxPackedVertex 32o: xyz@0, color@16 BGRA, texCoord@20 half).
-            const uint32_t surf = (surfIndex + s) * 56u;
-            const uint16_t vertCount = view.U16(surfs, surf + 2);
-            const uint16_t triCount = view.U16(surfs, surf + 4);
-            const uint32_t triIndices = view.U32(surfs, surf + 12);
-            const uint32_t verts0 = view.U32(surfs, surf + 28);
-            if (vertCount == 0 || triCount == 0
-                || !view.ValidRef(verts0, vertCount * 32u)
-                || !view.ValidRef(triIndices, triCount * 6u)) {
-                continue;
-            }
-            const uint32_t baseVertex = static_cast<uint32_t>(scene.viewmodelVertices.size() / 9);
-            const uint8_t* vertexData = view.Ptr(verts0);
-            for (uint32_t vertex = 0; vertex < vertCount; ++vertex) {
-                const uint8_t* packed = vertexData + static_cast<size_t>(vertex) * 32;
-                float position[3];
-                std::memcpy(position, packed, 12);
-                const uint8_t* color = packed + 16;
-                uint16_t texCoord[2];
-                std::memcpy(texCoord, packed + 20, 4);
-                scene.viewmodelVertices.insert(scene.viewmodelVertices.end(), {
-                    position[0], position[1], position[2],
-                    HalfToFloat(texCoord[0]), HalfToFloat(texCoord[1]),
-                    color[2] / 255.0f, color[1] / 255.0f, color[0] / 255.0f, color[3] / 255.0f,
-                });
-            }
-            KisakWorldDrawSurface draw;
-            draw.firstIndex = static_cast<uint32_t>(scene.viewmodelIndices.size());
-            draw.indexCount = 3u * triCount;
-            uint32_t materialRef = 0;
-            if (view.ValidRef(materials, (surfIndex + s + 1u) * 4u)) {
-                materialRef = view.U32(materials, (surfIndex + s) * 4u);
-            }
-            const SurfaceState state = resolveSurfaceState(materialRef);
-            draw.textureIndex = state.textureIndex;
-            draw.alphaTestRef = state.alphaTestRef;
-            draw.blended = state.blended;
-            draw.srcBlend = state.srcBlend;
-            draw.dstBlend = state.dstBlend;
-            draw.cullNone = state.cullNone;
-            const uint8_t* localIndices = view.Ptr(triIndices);
-            for (uint32_t k = 0; k < 3u * triCount; ++k) {
-                uint16_t index = 0;
-                std::memcpy(&index, localIndices + static_cast<size_t>(k) * 2, 2);
-                scene.viewmodelIndices.push_back(baseVertex + index);
-            }
-            scene.viewmodelSurfaces.push_back(draw);
-        }
-        if (!scene.viewmodelSurfaces.empty()) {
-            scene.hasViewmodel = true;
-            scene.viewmodelWeaponName = zone.weapons[w];
-        }
+        scene.viewmodelVertices = mesh.vertices;
+        scene.viewmodelIndices = mesh.indices;
+        scene.viewmodelSurfaces = mesh.surfaces;
+        scene.hasViewmodel = true;
+        scene.viewmodelWeaponName = zone.weapons[w];
         break; // first usable weapon only — no loadout system yet
     }
 
@@ -606,6 +730,7 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
             mapEnts = view.U32(clipMap, 164);
         }
     }
+    std::vector<EntityModelSpawn> entityModels;
     if (mapEnts != 0 && view.ValidRef(mapEnts, 12)) {
         const uint32_t entityString = view.U32(mapEnts, 4);
         const uint32_t entityChars = view.U32(mapEnts, 8);
@@ -613,11 +738,69 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
             const std::string entities(
                 reinterpret_cast<const char*>(view.Ptr(entityString)), entityChars - 1);
             ParseSpawnPoint(entities, scene);
+            ParseModelEntities(entities, entityModels);
         }
     }
     if (!scene.hasSpawn) {
         for (int axis = 0; axis < 3; ++axis) {
             scene.spawnOrigin[axis] = (scene.mins[axis] + scene.maxs[axis]) * 0.5f;
+        }
+    }
+
+    // map_ents static decoration (script_model/misc_model — non-scripted
+    // clutter: crates, lights, signage) as more instanced XModels, appended
+    // to the SAME pool as the world's own baked static props (dpvs smodels
+    // above) since these have a fixed placement too, not a per-frame one
+    // like the viewmodel. Grouped by model name so identical props (a
+    // common case) share one extracted mesh.
+    if (!entityModels.empty()) {
+        std::map<std::string, std::vector<const EntityModelSpawn*>> spawnsByModel;
+        for (const EntityModelSpawn& spawn : entityModels) {
+            spawnsByModel[spawn.model].push_back(&spawn);
+        }
+        for (const auto& [modelName, spawns] : spawnsByModel) {
+            uint32_t model = FindXModelRefByName(zone, view, modelName);
+            if (model == 0) {
+                continue; // referenced model not in this zone's own asset directory
+            }
+            const ExtractedXModelMesh extracted = extractXModelMesh(model);
+            if (extracted.surfaces.empty()) {
+                continue;
+            }
+            const uint32_t baseVertex = static_cast<uint32_t>(scene.modelVertices.size() / 9);
+            const uint32_t baseIndex = static_cast<uint32_t>(scene.modelIndices.size());
+            scene.modelVertices.insert(
+                scene.modelVertices.end(), extracted.vertices.begin(), extracted.vertices.end());
+            for (uint32_t index : extracted.indices) {
+                scene.modelIndices.push_back(baseVertex + index);
+            }
+            KisakWorldModelMesh mesh;
+            mesh.modelName = modelName;
+            mesh.firstInstance = static_cast<uint32_t>(scene.modelInstances.size() / 12);
+            mesh.instanceCount = static_cast<uint32_t>(spawns.size());
+            for (const KisakWorldDrawSurface& surface : extracted.surfaces) {
+                KisakWorldDrawSurface offsetSurface = surface;
+                offsetSurface.firstIndex += baseIndex;
+                mesh.surfaces.push_back(offsetSurface);
+            }
+            for (const EntityModelSpawn* spawn : spawns) {
+                // Yaw-only rotation about Z (this engine's own Z-up
+                // convention) — script_model/misc_model entities are placed
+                // axis-aligned or yaw-rotated in practice; pitch/roll aren't
+                // applied.
+                constexpr float kDegToRad = 0.01745329252f;
+                const float yaw = spawn->yawDegrees * kDegToRad;
+                const float basisX[3] = {std::cos(yaw) * spawn->scale, std::sin(yaw) * spawn->scale, 0.0f};
+                const float basisY[3] = {-std::sin(yaw) * spawn->scale, std::cos(yaw) * spawn->scale, 0.0f};
+                const float basisZ[3] = {0.0f, 0.0f, spawn->scale};
+                scene.modelInstances.insert(scene.modelInstances.end(), {
+                    basisX[0], basisX[1], basisX[2],
+                    basisY[0], basisY[1], basisY[2],
+                    basisZ[0], basisZ[1], basisZ[2],
+                    spawn->origin[0], spawn->origin[1], spawn->origin[2],
+                });
+            }
+            scene.models.push_back(std::move(mesh));
         }
     }
 
