@@ -415,3 +415,64 @@ arithmetic/comparison/logical operators, method calls, field access,
 postfix/prefix unary, bare calls, return) also parses cleanly into a
 correct AST — validates the broader baseline this step's context brief
 named, not just the minimal target.
+
+## Addendum — Step 8 findings (compiler)
+
+Source: `plans/android-gscript-vm-port.md`, Step 8 — the plan's first hard
+join point (Steps 3+4+7) and, alongside Step 3, a "strongest" model-tier
+step.
+
+**The real target script chosen in Step 7 (`character_sp_sas_ct_neal.gsc`)
+cannot compile to a running program with the current VM, and this is
+expected, not a bug.** Two independent reasons, both genuine and
+pre-existing (not introduced by this step): (1) `self.voice = "british"`
+is a field assignment on `self` — Step 3's VM has no entity/object model
+at all (no `OP_GetSelf`/`OP_GetLevel`/`OP_GetGame`, no
+`OP_Eval*FieldVariable` handling); (2) `setModel`/`precacheModel` are real
+engine builtins that are not among Step 4's 11-entry table. The compiler
+correctly REJECTS both with specific, distinct error messages rather than
+crashing or emitting garbage bytecode:
+
+```
+function main, line 4: method call 'setModel' needs an entity/object model:
+  no self/level/game object model exists in this VM yet — deferred subsystem
+  (step 9+), see step 8 findings
+function main, line 5: field assignment '.voice' needs an entity/object model:
+  no self/level/game object model exists in this VM yet — deferred subsystem
+  (step 9+), see step 8 findings
+function precache, line 10: unknown function/builtin: 'precacheModel'
+  (no builtin by that name and no function so-named in this program;
+  there is no cross-file linking in this step)
+```
+
+Per the plan's own task 5 ("if the target script doesn't exercise print/
+setdvar/any builtin, deliberately compile and run a small hand-picked or
+hand-trimmed real script that does"), a hand-written script (locals,
+arithmetic, `for` loop, a forward-referenced script-to-script call, and
+`print`/`setdvar`/`getdvar`) was compiled and executed instead, as the
+actual full-pipeline (lex→parse→compile→execute) observable-output proof:
+`print` produced exactly `sum=15` (1+2+3+4+5, matching a manual trace) and
+`getdvar("kisak_sum")` round-tripped to `"15"` after `setdvar`. A second
+extra-coverage script (if/else-if/else + while + return values) also ran
+correctly.
+
+Two design decisions worth recording for Step 9+ (both verified against
+Step 3's actual VM semantics, not assumed):
+- **Local-variable slots are allocated in a fixed frame per function**
+  (a pre-scan finds every assigned identifier before emitting the body,
+  creates them all in the prologue, so each variable's cached index stays
+  constant for the whole function) — the VM addresses locals newest-first,
+  so lazily-created locals would have had a shifting cached index.
+- **`&&`/`||` have no direct opcode** and lower to the VM's
+  `OP_JumpOnFalseExpr`/`OP_JumpOnTrueExpr` — traced against Step 3's exact
+  implementation to confirm the short-circuit polarity is correct
+  (`OP_JumpOnFalseExpr`: truthy-left pops and falls through to evaluate
+  the right operand, falsy-left keeps the value and skips it — exactly
+  `&&`'s semantics; `OP_JumpOnTrueExpr` is the mirror for `||`).
+- Unary `-x` lowers to `0 - x` (no dedicated negate opcode); `&"..."`
+  (`IStringLiteralExpr`) degrades to a plain `OP_GetString` since the VM
+  has no `OP_GetIString` handler or localization table.
+
+No VM gaps needed fixing in Step 3/4's files — every construct in the
+supported subset (everything except self/level/game/field-access) mapped
+cleanly onto already-implemented opcodes.
