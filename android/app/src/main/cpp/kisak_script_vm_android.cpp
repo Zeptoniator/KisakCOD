@@ -258,10 +258,21 @@ KisakScriptValue KisakScriptValue::Marker(KisakScriptValueType marker) {
     return out;
 }
 
+KisakScriptValue KisakScriptValue::FunctionRef(uint32_t entryOffset) {
+    KisakScriptValue out;
+    out.type = KisakScriptValueType::FunctionRef;
+    out.functionEntryOffset = entryOffset;
+    return out;
+}
+
 bool KisakScriptValue::Truthy() const {
     switch (type) {
         case KisakScriptValueType::Int: return i != 0;
         case KisakScriptValueType::Float: return f != 0.0f;
+        // A function reference is always a valid, non-null value once
+        // constructed (there's no "null function pointer" state in this
+        // trimmed VM) — matches retail treating VAR_FUNCTION as truthy.
+        case KisakScriptValueType::FunctionRef: return true;
         default: return false;
     }
 }
@@ -279,6 +290,9 @@ std::string KisakScriptValue::Describe() const {
         case KisakScriptValueType::String: return "string(\"" + s + "\")";
         case KisakScriptValueType::CodePos: return "<codepos>";
         case KisakScriptValueType::PreCodePos: return "<precodepos>";
+        case KisakScriptValueType::FunctionRef:
+            std::snprintf(buf, sizeof(buf), "function(@%u)", functionEntryOffset);
+            return buf;
     }
     return "<?>";
 }
@@ -296,6 +310,7 @@ std::string KisakScriptValue::AsString() const {
         case KisakScriptValueType::String: return s;
         case KisakScriptValueType::CodePos:
         case KisakScriptValueType::PreCodePos:
+        case KisakScriptValueType::FunctionRef:
             return "";
     }
     return "";
@@ -720,6 +735,18 @@ void Interpreter::Run() {
                 push(KisakScriptValue::Str(program.stringPool[id]));
                 break;
             }
+            // Namespaced-calls blueprint step 1: pushes a first-class
+            // function reference (retail VAR_FUNCTION) — the mechanism
+            // behind `default_start(::foo)`, where `::foo` is evaluated as
+            // a VALUE rather than called immediately. Reads the SAME 4-byte
+            // codepos operand convention as OP_ScriptFunctionCall
+            // (cursor.ReadCodePos(), a byte offset into this program's own
+            // bytecode — not a raw pointer, matching step 2's own
+            // host-width-independent design). No compiler emits this yet
+            // (step 2/3's job); this step is inert until then.
+            case KisakScriptOpcode::OP_GetFunction:
+                push(KisakScriptValue::FunctionRef(cursor.ReadCodePos()));
+                break;
 
             // ---- locals ----
             case KisakScriptOpcode::OP_CreateLocalVariable:

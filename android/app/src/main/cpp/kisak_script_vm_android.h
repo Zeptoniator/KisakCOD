@@ -249,6 +249,12 @@ enum class KisakScriptValueType : uint8_t {
     String,
     CodePos,     // internal marker: a script-function frame boundary on the stack
     PreCodePos,  // internal marker: delimits the start of a call's arguments
+    // GScript namespaced-calls blueprint (plans/android-gscript-namespaced-
+    // calls.md), step 1: retail's VAR_FUNCTION — a function reference usable
+    // as a first-class value (the mechanism behind `default_start(::foo)`,
+    // where `::foo` is evaluated as a VALUE and passed as an argument, not
+    // called immediately). Produced by OP_GetFunction.
+    FunctionRef,
 };
 
 struct KisakScriptValue {
@@ -256,12 +262,22 @@ struct KisakScriptValue {
     int32_t i = 0;
     float f = 0.0f;
     std::string s;
+    // Dedicated payload for FunctionRef: a byte offset into the owning
+    // KisakScriptProgram::bytecode, same convention as OP_ScriptFunctionCall's
+    // embedded operand (KisakScriptCursor::ReadCodePos, uint32_t). NOT stored
+    // in `i` (int32_t) — offsets are unsigned by nature (matching
+    // functionEntryPoints' uint32_t and ReadCodePos' return type), and reusing
+    // `i` would conflate a bytecode-position payload with the Int variant's
+    // arithmetic semantics for no benefit (CodePos/PreCodePos, by contrast,
+    // are pure markers with no payload at all, so they had nothing to reuse).
+    uint32_t functionEntryOffset = 0;
 
     static KisakScriptValue Undefined();
     static KisakScriptValue Int(int32_t v);
     static KisakScriptValue Float(float v);
     static KisakScriptValue Str(std::string v);
     static KisakScriptValue Marker(KisakScriptValueType marker);
+    static KisakScriptValue FunctionRef(uint32_t entryOffset);
 
     bool IsNumeric() const { return type == KisakScriptValueType::Int ||
                                     type == KisakScriptValueType::Float; }
