@@ -438,6 +438,28 @@ private:
         ExpectOp(")");
     }
 
+    // Namespaced-calls blueprint step 2: called once the `::` prefix and the
+    // function name have both already been consumed (pathSegments may be
+    // empty for a bare `::func` reference with no path). Disambiguates the
+    // call form (`(args)` follows) from the bare value-reference form
+    // (`default_start( ::inside_start )`, killhouse.gsc line 27) by a
+    // single-token lookahead, same pattern ParsePrimary's plain Identifier
+    // case already uses for CallExpr vs IdentifierExpr.
+    std::unique_ptr<KisakAstNode> ParseNamespacedTail(
+        uint32_t line, std::vector<std::string> pathSegments, const std::string& funcName) {
+        if (CheckOp("(")) {
+            auto call = MakeNode(Kind::NamespacedCallExpr, line);
+            call->text = funcName;
+            call->stringList = std::move(pathSegments);
+            ParseArgList(*call);
+            return call;
+        }
+        auto node = MakeNode(Kind::FunctionRefExpr, line);
+        node->text = funcName;
+        node->stringList = std::move(pathSegments);
+        return node;
+    }
+
     std::unique_ptr<KisakAstNode> ParsePrimary() {
         uint32_t line = CurLine();
         if (AtEnd()) { Fail("unexpected end of input"); return MakeNode(Kind::UndefinedLiteralExpr, line); }
@@ -470,6 +492,24 @@ private:
             }
             case KisakScriptTokenType::Identifier: {
                 std::string name = Advance().text;
+                if (CheckOp("\\")) {
+                    // Namespaced call/reference: path\...\file::func(...) or
+                    // path\...\file::func (bare value). Real corpus uses 1+
+                    // path segments (e.g. maps\_blackhawk::main(), and
+                    // maps\createart\killhouse_art::main() with 2) — collect
+                    // all of them before expecting the `::`.
+                    std::vector<std::string> pathSegments;
+                    pathSegments.push_back(name);
+                    while (MatchOp("\\")) {
+                        std::string segment;
+                        if (!ExpectIdentifier(segment)) return MakeNode(Kind::UndefinedLiteralExpr, line);
+                        pathSegments.push_back(segment);
+                    }
+                    if (!ExpectOp("::")) return MakeNode(Kind::UndefinedLiteralExpr, line);
+                    std::string funcName;
+                    if (!ExpectIdentifier(funcName)) return MakeNode(Kind::UndefinedLiteralExpr, line);
+                    return ParseNamespacedTail(line, std::move(pathSegments), funcName);
+                }
                 if (CheckOp("(")) {
                     // Bare call: precacheModel(...), add(a, b), etc.
                     auto call = MakeNode(Kind::CallExpr, line);
@@ -516,6 +556,17 @@ private:
                     ExpectOp(")");
                     return inner;
                 }
+                if (tok.text == "::") {
+                    // Bare function pointer, no path prefix: `::inside_start`
+                    // (killhouse.gsc line 27, used as a value — the common
+                    // real-corpus form) or, for completeness, `::func(...)`
+                    // as an immediate call. Empty pathSegments distinguishes
+                    // this from the path-prefixed form in ParseNamespacedTail.
+                    Advance();
+                    std::string funcName;
+                    if (!ExpectIdentifier(funcName)) return MakeNode(Kind::UndefinedLiteralExpr, line);
+                    return ParseNamespacedTail(line, {}, funcName);
+                }
                 Fail("unexpected operator '" + tok.text + "' in expression");
                 return MakeNode(Kind::UndefinedLiteralExpr, line);
             default:
@@ -557,6 +608,8 @@ std::string DescribeAstNodeKind(KisakAstNodeKind kind) {
         case Kind::UnaryExpr: return "UnaryExpr";
         case Kind::CallExpr: return "CallExpr";
         case Kind::MethodCallExpr: return "MethodCallExpr";
+        case Kind::NamespacedCallExpr: return "NamespacedCallExpr";
+        case Kind::FunctionRefExpr: return "FunctionRefExpr";
         case Kind::FieldAccessExpr: return "FieldAccessExpr";
         case Kind::IdentifierExpr: return "IdentifierExpr";
         case Kind::IntLiteralExpr: return "IntLiteralExpr";
@@ -577,9 +630,11 @@ std::string DumpAst(const KisakAstNode& node, int indent) {
     if (node.kind == KisakAstNodeKind::FloatLiteralExpr) out += " " + std::to_string(node.floatValue);
     if (node.kind == KisakAstNodeKind::BoolLiteralExpr) out += node.intValue ? " true" : " false";
     if (!node.stringList.empty()) {
-        out += " params=(";
+        bool isPath = node.kind == KisakAstNodeKind::NamespacedCallExpr ||
+                      node.kind == KisakAstNodeKind::FunctionRefExpr;
+        out += isPath ? " path=(" : " params=(";
         for (size_t i = 0; i < node.stringList.size(); ++i) {
-            if (i) out += ", ";
+            if (i) out += isPath ? "\\" : ", ";
             out += node.stringList[i];
         }
         out += ")";

@@ -68,6 +68,23 @@ enum class KisakAstNodeKind : uint8_t {
     UnaryExpr,             // text = operator; children[0] = operand
     CallExpr,              // text = function name; children = args
     MethodCallExpr,        // text = method name; children[0] = object, children[1..] = args
+    // Namespaced-calls blueprint (plans/android-gscript-namespaced-calls.md)
+    // step 2. text = function name; stringList = path segments (e.g.
+    // `maps\_blackhawk::main()` -> stringList=["maps","_blackhawk"],
+    // text="main"; a BARE `::func(...)` call with no path prefix has an
+    // EMPTY stringList, distinguishing it from CallExpr only by the `::`
+    // having been seen); children = args. Mirrors CallExpr with one added
+    // field, per the architecture facts: retail's local-vs-far distinction
+    // is about which symbol table the compiler searches, not a different
+    // call mechanism, so the parser only needs to record "was a path/`::`
+    // prefix present," not decide resolution strategy.
+    NamespacedCallExpr,
+    // Same path/name capture as NamespacedCallExpr, but used as a VALUE, not
+    // called — the `default_start( ::inside_start )` case (killhouse.gsc
+    // line 27): a bare `::name` or `path\name::func` reference with NO
+    // call parens following. text = function name; stringList = path
+    // segments (empty for the no-path bare-`::` form). No children.
+    FunctionRefExpr,
     FieldAccessExpr,       // text = field name; children[0] = object
     IdentifierExpr,        // text = name (also used for self/level/game keyword references)
     IntLiteralExpr,        // intValue
@@ -84,7 +101,8 @@ struct KisakAstNode {
     std::string text;      // meaning depends on kind — see KisakAstNodeKind comments
     int32_t intValue = 0;
     float floatValue = 0.0f;
-    std::vector<std::string> stringList;  // FunctionDef's parameter names
+    std::vector<std::string> stringList;  // FunctionDef's parameter names,
+                                           // or NamespacedCallExpr/FunctionRefExpr's path segments
     std::vector<std::unique_ptr<KisakAstNode>> children;
 
     explicit KisakAstNode(KisakAstNodeKind k, uint32_t ln) : kind(k), line(ln) {}
