@@ -301,3 +301,54 @@ the reference tree directly overturned it.
   classname both handle, positions identical. World rendered with no
   regression (255 static models / 12225 instances, matching the prior
   session's baseline exactly).
+
+## Addendum — Step 6 findings (lexer)
+
+Source: `plans/android-gscript-vm-port.md`, Step 6. `scr_yacc2.cpp`
+(flex-generated `yylex`) has NO human-readable keyword strings anywhere in
+its accepting actions — each DFA rule's action is just `return 261;`,
+`return 262;`, etc, with the matched text fully absorbed into the
+compressed state-transition tables. Transliterating it would mean
+reverse-engineering `yy_accept`/`yy_ec`/`yy_base`/`yy_nxt`/`yy_chk` by
+hand for no real benefit. Instead, the keyword set was cross-referenced
+from `scr_yacc.h`'s `Enum_t` (line 7-97) — this grammar's keywords are
+each their own AST node kind (`ENUM_if`, `ENUM_while`, `ENUM_waittill`,
+`ENUM_thread`, ...), so that enum is effectively a keyword list already —
+and operators/literal formats/comment style were grep-verified directly
+against the real `.gsc` corpus rather than assumed from generic C-family
+convention.
+
+One genuinely non-obvious finding from reading `scr_yacc2.cpp`'s accepting
+actions directly (~line 503-511): `"..."` and `&"..."` share the same
+`StringValue()` escape-decoder, but `&"..."` strips a 2-char prefix/1-char
+suffix (`yytext+2, yyleng-3`) vs plain strings' 1-char prefix/suffix
+(`yytext+1, yyleng-2`) — i.e. **`&"KEY"` is lexed as ONE token** (an
+interned/localized string, matching `OP_GetIString`), not `&` followed by
+a separate `STRING` token. The new lexer preserves this exactly
+(`IStringLiteral` as its own token type).
+
+Grep-confirmed against the real corpus (not assumed): `//` line comments,
+`/* ... */` block comments (found in `aitype/*.gsc` `QUAKED` spawner
+doc-comments), `::` (namespaced/function-pointer calls), `++`/`--`, `&&`,
+`!=`, `==`, `-=` (compound assignment, confirmed at least once — `+=`/
+`*=`/`/=`/`%=` included by the same pattern but not directly observed),
+leading-dot float literals (`.1`, `.5` — e.g. `wait .1;`, no leading `0`),
+`\` as a path separator in namespaced calls/includes (`maps\_utility`).
+NOT observed anywhere in this corpus, and NOT included/assumed: hex
+integer literals, ternary `?:`, bit-shift operators `<<`/`>>`, float
+literals with an `f` suffix (`<<`/`>>` are still lexed as 2-char operator
+tokens defensively, since they cost nothing to recognize, but their
+absence from every real sample checked is worth flagging for step 7).
+
+Host validation: **all 32 real `.gsc` files** pulled in step 1 (not just
+the handful excerpted above) tokenize with 0 lexer errors — the full
+9,567-token `maps/killhouse.gsc`, all `character/*.gsc` and `aitype/*.gsc`
+files, `_c4.gsc`, `killhouse_code.gsc`/`killhouse_fx.gsc`/
+`killhouse_anim.gsc`, and the `code_post_gfx` library scripts. Feature
+spot-checks on `killhouse.gsc` confirmed correct classification of
+`thread`/`waittill`/`notify`/`endon`/`if`/`else`/`while`/`include`
+keywords, 140+ `&"..."` istring literals, `::` and `\` operators, and
+leading-dot float literals. A block-comment-containing `switch`/`case`
+file (`ally_sas_woodland_smg_mp5.gsc`) tokenized its `switch`/`case`/
+`break` keywords correctly with the leading `/*QUAKED ...*/` doc-comment
+skipped cleanly.

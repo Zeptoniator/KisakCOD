@@ -25,6 +25,7 @@ add_library(kisakcod_android SHARED
     kisak_menu_scene_android.cpp
     kisak_menu_state_android.cpp
     kisak_script_entity_android.cpp
+    kisak_script_lexer_android.cpp
     kisak_script_vm_android.cpp
     kisak_world_scene_android.cpp
     kisak_zone_loader_android.cpp
