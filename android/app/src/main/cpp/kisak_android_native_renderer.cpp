@@ -90,6 +90,90 @@ struct WorldModelDraw {
     std::vector<WorldDrawRun> surfaces;
 };
 
+// Hitscan fire (fixed instant-hit, no ammo/loadout): a persistent impact
+// mark left where the ray met solid geometry.
+struct WorldDecal {
+    float point[3];
+    float normal[3];
+};
+
+// Viewmodel + muzzle-flash placement offset, camera-relative (forward,
+// right, down). Shared so a fired shot's flash lines up with the gun the
+// player is actually looking at.
+constexpr float kViewmodelForwardOffset = 14.0f;
+constexpr float kViewmodelRightOffset = 6.0f;
+constexpr float kViewmodelDownOffset = 10.0f;
+
+// COD4 convention (0 = +X, Z-up): forward/right/up basis from yaw/pitch.
+void ComputeCameraBasis(float yawDeg, float pitchDeg, float f[3], float r[3], float u[3]) {
+    constexpr float kDegToRad = 0.01745329252f;
+    const float yaw = yawDeg * kDegToRad;
+    const float pitch = pitchDeg * kDegToRad;
+    f[0] = std::cos(yaw) * std::cos(pitch);
+    f[1] = std::sin(yaw) * std::cos(pitch);
+    f[2] = std::sin(pitch);
+    r[0] = std::sin(yaw);
+    r[1] = -std::cos(yaw);
+    r[2] = 0.0f;
+    u[0] = r[1] * f[2] - r[2] * f[1];
+    u[1] = r[2] * f[0] - r[0] * f[2];
+    u[2] = r[0] * f[1] - r[1] * f[0];
+}
+
+int64_t NowMonotonicMs() {
+    struct timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec * 1000ll + now.tv_nsec / 1000000ll;
+}
+
+// Appends a double-sided quad of `size` centered at `point`, spanning the
+// given right/up basis (billboarded muzzle flash) — 6 verts, 3 floats each.
+void AppendQuad(const float point[3], const float right[3], const float up[3], float size, std::vector<float>& out) {
+    const float h = size * 0.5f;
+    float corners[4][3];
+    for (int i = 0; i < 3; ++i) {
+        corners[0][i] = point[i] - right[i] * h - up[i] * h;
+        corners[1][i] = point[i] + right[i] * h - up[i] * h;
+        corners[2][i] = point[i] + right[i] * h + up[i] * h;
+        corners[3][i] = point[i] - right[i] * h + up[i] * h;
+    }
+    constexpr int kIndices[6] = {0, 1, 2, 0, 2, 3};
+    for (int index : kIndices) {
+        out.insert(out.end(), corners[index], corners[index] + 3);
+    }
+}
+
+// Appends a double-sided quad of `size` centered at `point`, spanning the
+// plane perpendicular to `normal` (impact decals) — 6 verts (2 triangles),
+// 3 floats each.
+void AppendQuadOnPlane(const float point[3], const float normal[3], float size, std::vector<float>& out) {
+    float reference[3] = {0.0f, 0.0f, 1.0f};
+    if (std::fabs(normal[2]) > 0.9f) {
+        reference[0] = 1.0f;
+        reference[1] = 0.0f;
+        reference[2] = 0.0f;
+    }
+    float tangent1[3] = {
+        normal[1] * reference[2] - normal[2] * reference[1],
+        normal[2] * reference[0] - normal[0] * reference[2],
+        normal[0] * reference[1] - normal[1] * reference[0],
+    };
+    const float len = std::sqrt(
+        tangent1[0] * tangent1[0] + tangent1[1] * tangent1[1] + tangent1[2] * tangent1[2]);
+    if (len < 1e-6f) {
+        return;
+    }
+    for (float& component : tangent1) {
+        component /= len;
+    }
+    const float tangent2[3] = {
+        normal[1] * tangent1[2] - normal[2] * tangent1[1],
+        normal[2] * tangent1[0] - normal[0] * tangent1[2],
+        normal[0] * tangent1[1] - normal[1] * tangent1[0],
+    };
+    AppendQuad(point, tangent1, tangent2, size, out);
+}
+
 // Background map-zone loader: the launch command kicks a worker thread that
 // decompresses the map fastfile, runs the zone loader, and publishes the
 // extracted world scene for the render thread to upload.
@@ -210,6 +294,19 @@ struct GlContext {
     float worldTouchStartY = 0.0f;
     float worldTouchLastX = 0.0f;
     float worldTouchLastY = 0.0f;
+    int64_t worldTouchDownTimeMs = 0;
+    // Hitscan fire (fixed instant-hit raycast, no ammo/loadout): a look-zone
+    // tap that stays near its start point and releases quickly (see
+    // UpdateWorldCamera) fires instead of being read as a look-drag.
+    // Persistent impact decals + a brief muzzle flash, drawn with their own
+    // small position-only program since the primitive count is tiny.
+    GLuint worldMarkerProgram = 0;
+    GLuint worldMarkerVbo = 0;
+    GLint worldMarkerMvpUniform = -1;
+    GLint worldMarkerColorUniform = -1;
+    std::vector<WorldDecal> worldDecals;
+    int64_t worldMuzzleFlashUntilMs = 0;
+    float worldMuzzleFlashPoint[3] = {0.0f, 0.0f, 0.0f};
 };
 
 struct TouchSnapshot {
@@ -951,6 +1048,47 @@ void main() {
     return program;
 }
 
+// Impact decals + muzzle flash: flat-colored world-space quads, rebuilt into
+// one small CPU buffer per frame since the primitive count is tiny.
+GLuint CreateWorldMarkerProgram() {
+    constexpr const char* kVertexShader = R"(#version 300 es
+layout(location = 0) in vec3 aPosition;
+uniform mat4 uMvp;
+void main() {
+    gl_Position = uMvp * vec4(aPosition, 1.0);
+}
+)";
+    constexpr const char* kFragmentShader = R"(#version 300 es
+precision mediump float;
+uniform vec4 uColor;
+out vec4 fragColor;
+void main() {
+    fragColor = uColor;
+}
+)";
+    const GLuint vertexShader = CompileShader(GL_VERTEX_SHADER, kVertexShader);
+    const GLuint fragmentShader = CompileShader(GL_FRAGMENT_SHADER, kFragmentShader);
+    if (vertexShader == 0 || fragmentShader == 0) {
+        return 0;
+    }
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+        char log[512]{};
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "Marker program link failed: %s", log);
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
 // World textures tile (raw texCoords go well past 1.0), so they need REPEAT
 // wrapping and mips, unlike the clamped UI textures.
 GLuint CreateWorldTexture(GlContext& gl, const std::string& imageName) {
@@ -1024,6 +1162,16 @@ void DestroyWorldSceneResources(GlContext& gl) {
     }
     gl.worldViewmodelSurfaces.clear();
     gl.worldHasViewmodel = false;
+    if (gl.worldMarkerVbo != 0) {
+        glDeleteBuffers(1, &gl.worldMarkerVbo);
+        gl.worldMarkerVbo = 0;
+    }
+    if (gl.worldMarkerProgram != 0) {
+        glDeleteProgram(gl.worldMarkerProgram);
+        gl.worldMarkerProgram = 0;
+    }
+    gl.worldDecals.clear();
+    gl.worldMuzzleFlashUntilMs = 0;
     for (auto& [name, texture] : gl.worldTextureCache) {
         if (texture != 0) {
             glDeleteTextures(1, &texture);
@@ -1085,6 +1233,13 @@ bool InitWorldScene(GlContext& gl, const KisakWorldScene& scene) {
     gl.worldSunColor[0] = scene.sunColor[0];
     gl.worldSunColor[1] = scene.sunColor[1];
     gl.worldSunColor[2] = scene.sunColor[2];
+
+    gl.worldMarkerProgram = CreateWorldMarkerProgram();
+    if (gl.worldMarkerProgram != 0) {
+        gl.worldMarkerMvpUniform = glGetUniformLocation(gl.worldMarkerProgram, "uMvp");
+        gl.worldMarkerColorUniform = glGetUniformLocation(gl.worldMarkerProgram, "uColor");
+        glGenBuffers(1, &gl.worldMarkerVbo);
+    }
 
     glGenBuffers(1, &gl.worldVbo);
     glBindBuffer(GL_ARRAY_BUFFER, gl.worldVbo);
@@ -1356,8 +1511,55 @@ bool InitWorldScene(GlContext& gl, const KisakWorldScene& scene) {
     return true;
 }
 
+// Fixed instant-hit hitscan: no ammo, no reload, no per-weapon ballistics
+// (WeaponDef's fire time/damage/spread aren't ported — this is a raycast at
+// a constant range from the camera along its forward direction). Leaves a
+// persistent impact decal and starts a brief muzzle flash; both purely
+// visual, since there's no health/AI system yet for the hit to affect.
+void FireWorldWeapon(GlContext& gl) {
+    float f[3];
+    float r[3];
+    float u[3];
+    ComputeCameraBasis(gl.camYaw, gl.camPitch, f, r, u);
+    constexpr float kMaxRange = 8192.0f;
+    const KisakWorldRayHit hit = RaycastWorldBrushes(gl.worldBrushes, gl.worldBrushPlanes, gl.camPos, f, kMaxRange);
+
+    const int64_t nowMs = NowMonotonicMs();
+    gl.worldMuzzleFlashUntilMs = nowMs + 70;
+    for (int axis = 0; axis < 3; ++axis) {
+        gl.worldMuzzleFlashPoint[axis] = gl.camPos[axis]
+            + f[axis] * kViewmodelForwardOffset + r[axis] * kViewmodelRightOffset
+            - u[axis] * kViewmodelDownOffset;
+    }
+
+    if (hit.valid) {
+        WorldDecal decal;
+        for (int axis = 0; axis < 3; ++axis) {
+            // Nudge off the surface along its normal so the decal doesn't
+            // z-fight with the wall it's stuck to.
+            decal.point[axis] = hit.point[axis] + hit.normal[axis] * 0.5f;
+            decal.normal[axis] = hit.normal[axis];
+        }
+        gl.worldDecals.push_back(decal);
+        constexpr size_t kMaxDecals = 48;
+        if (gl.worldDecals.size() > kMaxDecals) {
+            gl.worldDecals.erase(gl.worldDecals.begin());
+        }
+        __android_log_print(
+            ANDROID_LOG_INFO, kLogTag,
+            "Tir: impact a %.0f u, point=(%.0f,%.0f,%.0f) normale=(%.2f,%.2f,%.2f)",
+            hit.distance, hit.point[0], hit.point[1], hit.point[2],
+            hit.normal[0], hit.normal[1], hit.normal[2]
+        );
+    } else {
+        __android_log_print(ANDROID_LOG_INFO, kLogTag, "Tir: aucun impact (hors de portee)");
+    }
+}
+
 // One-finger camera: left half of the screen is a virtual move stick
-// (free-fly along the view direction), right half drags the view.
+// (free-fly along the view direction), right half drags the view — unless
+// the finger releases close to where it went down without dragging, which
+// fires instead of being read as a look-drag.
 void UpdateWorldCamera(GlContext& gl) {
     const TouchSnapshot touch = GetTouchSnapshot();
     constexpr float kDegToRad = 0.01745329252f;
@@ -1367,7 +1569,18 @@ void UpdateWorldCamera(GlContext& gl) {
         gl.worldTouchStartY = touch.y;
         gl.worldTouchLastX = touch.x;
         gl.worldTouchLastY = touch.y;
+        gl.worldTouchDownTimeMs = NowMonotonicMs();
     } else if (touch.action == kTouchUp || touch.action == kTouchCancel) {
+        if (touch.action == kTouchUp && gl.worldTouchMode == 2) {
+            const float dx = touch.x - gl.worldTouchStartX;
+            const float dy = touch.y - gl.worldTouchStartY;
+            constexpr float kTapMaxMovePx = 16.0f;
+            constexpr int64_t kTapMaxDurationMs = 300;
+            if (dx * dx + dy * dy < kTapMaxMovePx * kTapMaxMovePx
+                && NowMonotonicMs() - gl.worldTouchDownTimeMs < kTapMaxDurationMs) {
+                FireWorldWeapon(gl);
+            }
+        }
         gl.worldTouchMode = 0;
     }
     if (gl.worldTouchMode == 2 && touch.action == kTouchMove) {
@@ -1407,20 +1620,10 @@ void UpdateWorldCamera(GlContext& gl) {
 
 void DrawWorldScene(GlContext& gl) {
     UpdateWorldCamera(gl);
-    constexpr float kDegToRad = 0.01745329252f;
-    const float yaw = gl.camYaw * kDegToRad;
-    const float pitch = gl.camPitch * kDegToRad;
-    const float f[3] = {
-        std::cos(yaw) * std::cos(pitch),
-        std::sin(yaw) * std::cos(pitch),
-        std::sin(pitch),
-    };
-    const float r[3] = {std::sin(yaw), -std::cos(yaw), 0.0f};
-    const float u[3] = {
-        r[1] * f[2] - r[2] * f[1],
-        r[2] * f[0] - r[0] * f[2],
-        r[0] * f[1] - r[1] * f[0],
-    };
+    float f[3];
+    float r[3];
+    float u[3];
+    ComputeCameraBasis(gl.camYaw, gl.camPitch, f, r, u);
     const float* pos = gl.camPos;
     // Column-major view matrix (rows r/u/-f, translated to the camera).
     float view[16] = {
@@ -1433,6 +1636,7 @@ void DrawWorldScene(GlContext& gl) {
         1.0f,
     };
     const float aspect = gl.height > 0 ? static_cast<float>(gl.width) / gl.height : 1.0f;
+    constexpr float kDegToRad = 0.01745329252f;
     const float fovScale = 1.0f / std::tan(65.0f * 0.5f * kDegToRad);
     const float nearZ = 4.0f;
     const float farZ = 60000.0f;
@@ -1651,16 +1855,16 @@ void DrawWorldScene(GlContext& gl) {
         if (!gl.worldHasViewmodel || gl.worldModelProgram == 0) {
             return;
         }
-        constexpr float kForwardOffset = 14.0f;
-        constexpr float kRightOffset = 6.0f;
-        constexpr float kDownOffset = 10.0f;
         const float instance[12] = {
             f[0], f[1], f[2],
             -r[0], -r[1], -r[2],
             u[0], u[1], u[2],
-            pos[0] + f[0] * kForwardOffset + r[0] * kRightOffset - u[0] * kDownOffset,
-            pos[1] + f[1] * kForwardOffset + r[1] * kRightOffset - u[1] * kDownOffset,
-            pos[2] + f[2] * kForwardOffset + r[2] * kRightOffset - u[2] * kDownOffset,
+            pos[0] + f[0] * kViewmodelForwardOffset + r[0] * kViewmodelRightOffset
+                - u[0] * kViewmodelDownOffset,
+            pos[1] + f[1] * kViewmodelForwardOffset + r[1] * kViewmodelRightOffset
+                - u[1] * kViewmodelDownOffset,
+            pos[2] + f[2] * kViewmodelForwardOffset + r[2] * kViewmodelRightOffset
+                - u[2] * kViewmodelDownOffset,
         };
         glUseProgram(gl.worldModelProgram);
         glUniformMatrix4fv(gl.worldModelMvpUniform, 1, GL_FALSE, mvp);
@@ -1747,12 +1951,59 @@ void DrawWorldScene(GlContext& gl) {
         glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
     };
 
+    // Hitscan fire feedback: persistent impact decals (normal depth test —
+    // they sit flush on real world geometry) plus a brief additive-ish
+    // muzzle flash near the viewmodel. Rebuilt into gl.worldMarkerVbo each
+    // frame; the primitive count is always tiny.
+    const auto drawWorldMarkers = [&]() {
+        if (gl.worldMarkerProgram == 0) {
+            return;
+        }
+        glUseProgram(gl.worldMarkerProgram);
+        glUniformMatrix4fv(gl.worldMarkerMvpUniform, 1, GL_FALSE, mvp);
+        glBindBuffer(GL_ARRAY_BUFFER, gl.worldMarkerVbo);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_CULL_FACE);
+
+        if (!gl.worldDecals.empty()) {
+            std::vector<float> verts;
+            verts.reserve(gl.worldDecals.size() * 18);
+            for (const WorldDecal& decal : gl.worldDecals) {
+                AppendQuadOnPlane(decal.point, decal.normal, 6.0f, verts);
+            }
+            glBufferData(
+                GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+                verts.data(), GL_DYNAMIC_DRAW
+            );
+            glUniform4f(gl.worldMarkerColorUniform, 0.05f, 0.05f, 0.05f, 0.85f);
+            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size() / 3));
+        }
+
+        if (NowMonotonicMs() < gl.worldMuzzleFlashUntilMs) {
+            std::vector<float> verts;
+            AppendQuad(gl.worldMuzzleFlashPoint, r, u, 5.0f, verts);
+            glBufferData(
+                GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+                verts.data(), GL_DYNAMIC_DRAW
+            );
+            glUniform4f(gl.worldMarkerColorUniform, 1.0f, 0.85f, 0.4f, 0.9f);
+            glDepthMask(GL_FALSE);
+            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size() / 3));
+            glDepthMask(GL_TRUE);
+        }
+
+        glDisable(GL_BLEND);
+    };
+
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
     glEnableVertexAttribArray(2);
     drawWorldRuns(false);
     drawWorldModels(false);
     drawViewmodel();
+    drawWorldMarkers();
     drawWorldSky();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);

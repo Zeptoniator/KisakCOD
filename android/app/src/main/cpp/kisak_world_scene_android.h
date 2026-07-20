@@ -62,6 +62,24 @@ bool ResolveWorldCollision(
     float position[3],
     float radius);
 
+struct KisakWorldRayHit {
+    bool valid = false;
+    float distance = 0.0f;
+    float point[3] = {0.0f, 0.0f, 0.0f};
+    float normal[3] = {0.0f, 0.0f, 1.0f}; // outward-facing
+};
+
+// Nearest solid-brush intersection along a ray, up to maxDistance. Same
+// convex-brush plane set as ResolveWorldCollision (implicit AABB planes from
+// mins/maxs plus the explicit non-axial sides), clipped with the standard
+// ray-vs-convex-polytope slab test instead of point-penetration depth.
+KisakWorldRayHit RaycastWorldBrushes(
+    const std::vector<KisakWorldBrush>& brushes,
+    const std::vector<float>& brushPlanes,
+    const float origin[3],
+    const float direction[3],
+    float maxDistance);
+
 // Decoded lightmap pair (zone-embedded images): primary is the L8 sun
 // visibility mask, secondary the baked radiosity color.
 struct KisakWorldLightmap {

@@ -1,6 +1,7 @@
 #include "kisak_world_scene_android.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <sstream>
@@ -824,6 +825,79 @@ bool ResolveWorldCollision(
         }
     }
     return moved;
+}
+
+KisakWorldRayHit RaycastWorldBrushes(
+    const std::vector<KisakWorldBrush>& brushes,
+    const std::vector<float>& brushPlanes,
+    const float origin[3],
+    const float direction[3],
+    float maxDistance
+) {
+    KisakWorldRayHit best;
+    best.distance = maxDistance;
+    for (const KisakWorldBrush& brush : brushes) {
+        float tmin = 0.0f;
+        float tmax = best.distance;
+        float hitNormal[3] = {0.0f, 0.0f, 1.0f};
+        bool rejected = false;
+        // Same (normal, dist) convention as ResolveWorldCollision: a point p
+        // is inside this one plane when dot(normal, p) <= dist. Entering
+        // (denom < 0, dot(normal,p) decreasing over t) tightens tmin and
+        // records the crossed plane as the candidate hit normal; exiting
+        // tightens tmax; parallel-and-already-outside rejects the brush.
+        const auto clip = [&](float nx, float ny, float nz, float d) {
+            if (rejected) {
+                return;
+            }
+            const float denom = nx * direction[0] + ny * direction[1] + nz * direction[2];
+            const float numer = d - (nx * origin[0] + ny * origin[1] + nz * origin[2]);
+            if (std::fabs(denom) < 1e-8f) {
+                if (numer < 0.0f) {
+                    rejected = true;
+                }
+                return;
+            }
+            const float t = numer / denom;
+            if (denom < 0.0f) {
+                if (t > tmin) {
+                    tmin = t;
+                    hitNormal[0] = nx;
+                    hitNormal[1] = ny;
+                    hitNormal[2] = nz;
+                }
+            } else if (t < tmax) {
+                tmax = t;
+            }
+            if (tmin > tmax) {
+                rejected = true;
+            }
+        };
+        for (int axis = 0; axis < 3 && !rejected; ++axis) {
+            float n[3] = {0.0f, 0.0f, 0.0f};
+            n[axis] = 1.0f;
+            clip(n[0], n[1], n[2], brush.maxs[axis]);
+            n[axis] = -1.0f;
+            clip(n[0], n[1], n[2], -brush.mins[axis]);
+        }
+        for (uint32_t p = 0; p < brush.planeCount && !rejected; ++p) {
+            const float* plane = &brushPlanes[(brush.firstPlane + p) * 4];
+            clip(plane[0], plane[1], plane[2], plane[3]);
+        }
+        if (!rejected && tmin >= 0.0f && tmin < best.distance) {
+            best.valid = true;
+            best.distance = tmin;
+            best.normal[0] = hitNormal[0];
+            best.normal[1] = hitNormal[1];
+            best.normal[2] = hitNormal[2];
+        }
+    }
+    if (best.valid) {
+        best.point[0] = origin[0] + direction[0] * best.distance;
+        best.point[1] = origin[1] + direction[1] * best.distance;
+        best.point[2] = origin[2] + direction[2] * best.distance;
+    }
+    return best;
 }
 
 float QueryWorldGround(const KisakWorldHeightfield& field, float x, float y, float maxZ) {
