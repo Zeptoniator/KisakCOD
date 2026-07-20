@@ -7,6 +7,7 @@
 #include "kisak_menu_scene_android.h"
 #include "kisak_menu_state_android.h"
 #include "kisak_world_scene_android.h"
+#include "kisak_zone_rawfile_android.h"
 
 #include <cmath>
 
@@ -857,6 +858,22 @@ void StartWorldLoad(const std::string& mapName) {
         if (!probe.fullyDecompressed) {
             scene->error = "decompression de " + mapName + ".ff: " + probe.error;
         } else {
+            // GScript blueprint (plans/android-gscript-vm-port.md) step 1:
+            // dump this zone's rawfiles too — the boot probe only ever did
+            // this for code_post_gfx.ff, but the mission zone is what
+            // actually carries maps/<name>.gsc.
+            {
+                const std::vector<KisakZoneRawFile> rawFiles = ScanZoneRawFiles(zoneData);
+                const std::string dumpRoot = AndroidFsBasePath() + "/dump/rawfiles/" + mapName;
+                std::string dumpErrors;
+                const uint32_t written = DumpZoneRawFiles(zoneData, rawFiles, dumpRoot, dumpErrors);
+                __android_log_print(
+                    ANDROID_LOG_INFO, kLogTag, "Zone rawfiles '%s': %s, %u dumpes vers %s%s",
+                    mapName.c_str(), DescribeZoneRawFiles(rawFiles).c_str(), written,
+                    dumpRoot.c_str(),
+                    dumpErrors.empty() ? "" : (" erreurs=" + dumpErrors).c_str()
+                );
+            }
             const KisakZoneLoadResult zone = LoadZoneAssets(zoneData);
             zoneData.clear();
             zoneData.shrink_to_fit();
