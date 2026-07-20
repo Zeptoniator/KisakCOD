@@ -134,6 +134,19 @@ struct KisakWorldScene {
     std::vector<float> viewmodelVertices;
     std::vector<uint32_t> viewmodelIndices;
     std::vector<KisakWorldDrawSurface> viewmodelSurfaces;
+    // Fire sound (see kisak_audio_android.h): interleaved PCM16, already
+    // converted from whatever bit depth the zone's LoadedSound clip used.
+    bool hasFireSound = false;
+    std::vector<int16_t> fireSoundSamples;
+    int fireSoundChannels = 1;
+    int fireSoundRate = 22050;
+    // VFS-relative path to a streamed .wav (set instead of fireSoundSamples
+    // when the alias's variant is a streamed dir/name pair rather than an
+    // in-memory clip — the more common case in practice for SP weapons).
+    // The scene builder doesn't do filesystem reads itself; InitWorldScene
+    // reads and parses it, same as world textures.
+    std::string fireSoundStreamedPath;
+    std::string fireSoundDiagnostic; // logged either way — see BuildWorldScene
     float mins[3] = {0.0f, 0.0f, 0.0f};
     float maxs[3] = {0.0f, 0.0f, 0.0f};
     float sunColor[3] = {1.0f, 1.0f, 0.9f};

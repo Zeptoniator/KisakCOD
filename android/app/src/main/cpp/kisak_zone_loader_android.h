@@ -51,6 +51,28 @@ struct KisakLoadedMaterial {
 struct KisakLoadedSoundAlias {
     std::string name;
     uint32_t aliasCount = 0;
+    // Names of the in-memory clips (KisakZoneLoadResult::loadedSounds) this
+    // alias's variants resolve to (soundFile type 1).
+    std::vector<std::string> loadedSoundNames;
+    // VFS-relative paths ("sound/<dir>/<name>" or "sound/<name>") for
+    // streamed (dir/name) variants — most COD4 SP weapon fire sounds turn
+    // out to be this case rather than an in-memory LoadedSound.
+    std::vector<std::string> streamedSoundPaths;
+};
+
+// MSS-wrapped WAV clip (LoadedSound, src/sound/snd_public.h:105), fully
+// extracted at load time — including the inline PCM/ADPCM payload, which
+// like image pixels lives in the rewinding temp block during the walk and
+// would be lost without an explicit copy.
+struct KisakLoadedSound {
+    std::string name;
+    uint32_t format = 0;   // WAVEFORMATEX-style tag (1 = PCM); see MssSoundCOD4
+    uint32_t rate = 0;     // Hz
+    int32_t bits = 0;      // bits per sample
+    int32_t channels = 0;
+    uint32_t samples = 0;
+    uint32_t blockSize = 0;
+    std::vector<uint8_t> data;
 };
 
 struct KisakLoadedFont {
@@ -75,7 +97,7 @@ struct KisakZoneLoadResult {
     std::vector<KisakLoadedSoundAlias> soundAliases;
     std::vector<KisakLoadedFont> fonts;
     uint32_t soundCurveCount = 0;
-    uint32_t loadedSoundCount = 0;
+    std::vector<KisakLoadedSound> loadedSounds;
     std::vector<std::string> menus;
     std::vector<std::string> weapons;
     // Parallel to weapons: each entry is the resolved zone-block reference to
@@ -84,6 +106,17 @@ struct KisakZoneLoadResult {
     // it exactly like any other resolved XModel ref (e.g. GfxWorld's static
     // prop instances).
     std::vector<uint32_t> weaponGunXModelRefs;
+    // Parallel to weapons: the fireSoundPlayer field's alias-list name (the
+    // first-person clip the wielder hears) — look it up in soundAliases,
+    // then loadedSounds by its first loadedSoundNames entry, to get the
+    // actual clip to play.
+    std::vector<std::string> weaponFireSoundNames;
+    // Parallel to weapons: the plain fireSound field (the "_npc"/world-heard
+    // variant). Per-map zones don't necessarily bundle the player variant's
+    // alias (it can live in a shared code zone this port doesn't load for
+    // gameplay) — this is the fallback when weaponFireSoundNames isn't
+    // found in the loaded zone's own soundAliases.
+    std::vector<std::string> weaponFireSoundNpcNames;
     std::vector<std::string> xmodels;
     std::vector<std::string> stringTables;
     uint32_t xanimCount = 0;

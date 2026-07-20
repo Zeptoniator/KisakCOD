@@ -1,6 +1,7 @@
 #include "kisak_android_native_renderer.h"
 
 #include "kisak_android_fs_runtime.h"
+#include "kisak_audio_android.h"
 #include "kisak_fastfile_android.h"
 #include "kisak_iwi_texture_android.h"
 #include "kisak_menu_scene_android.h"
@@ -282,6 +283,12 @@ struct GlContext {
     GLuint worldViewmodelIbo = 0;
     GLuint worldViewmodelInstanceVbo = 0;
     std::vector<WorldDrawRun> worldViewmodelSurfaces;
+    // Fire sound (see kisak_audio_android.h) — extracted once at scene
+    // build, played on demand by FireWorldWeapon via KisakAudioPlayClip.
+    bool worldHasFireSound = false;
+    std::vector<int16_t> worldFireSoundSamples;
+    int worldFireSoundChannels = 1;
+    int worldFireSoundRate = 22050;
     std::map<std::string, GLuint> worldTextureCache;
     std::string worldName;
     float camPos[3] = {0.0f, 0.0f, 0.0f};
@@ -1162,6 +1169,8 @@ void DestroyWorldSceneResources(GlContext& gl) {
     }
     gl.worldViewmodelSurfaces.clear();
     gl.worldHasViewmodel = false;
+    gl.worldFireSoundSamples.clear();
+    gl.worldHasFireSound = false;
     if (gl.worldMarkerVbo != 0) {
         glDeleteBuffers(1, &gl.worldMarkerVbo);
         gl.worldMarkerVbo = 0;
@@ -1458,6 +1467,37 @@ bool InitWorldScene(GlContext& gl, const KisakWorldScene& scene) {
         );
     }
 
+    if (scene.hasFireSound) {
+        gl.worldFireSoundSamples = scene.fireSoundSamples;
+        gl.worldFireSoundChannels = scene.fireSoundChannels;
+        gl.worldFireSoundRate = scene.fireSoundRate;
+        gl.worldHasFireSound = true;
+    } else if (!scene.fireSoundStreamedPath.empty()) {
+        // Streamed variant (the common case for SP weapon fire sounds):
+        // read the real .wav off the VFS, same as world textures.
+        const KisakVirtualFileRead wav =
+            AndroidFsReadFile(scene.fireSoundStreamedPath, 4 * 1024 * 1024);
+        int channels = 0;
+        int rate = 0;
+        std::vector<int16_t> samples;
+        if (wav.found && wav.error.empty() && !wav.data.empty()
+            && KisakAudioParseWav(wav.data.data(), wav.data.size(), samples, channels, rate)) {
+            gl.worldFireSoundSamples = std::move(samples);
+            gl.worldFireSoundChannels = channels;
+            gl.worldFireSoundRate = rate;
+            gl.worldHasFireSound = true;
+            __android_log_print(
+                ANDROID_LOG_INFO, kLogTag, "Son de tir '%s': %d Hz, %d canaux, %zu echantillons",
+                scene.fireSoundStreamedPath.c_str(), rate, channels, gl.worldFireSoundSamples.size()
+            );
+        } else {
+            __android_log_print(
+                ANDROID_LOG_WARN, kLogTag, "Son de tir '%s' illisible: trouve=%d erreur='%s' octets=%zu",
+                scene.fireSoundStreamedPath.c_str(), wav.found, wav.error.c_str(), wav.data.size()
+            );
+        }
+    }
+
     // Sky cubemap + program.
     if (scene.skyCubemap.valid) {
         gl.worldSkyProgram = CreateWorldSkyProgram();
@@ -1530,6 +1570,12 @@ void FireWorldWeapon(GlContext& gl) {
         gl.worldMuzzleFlashPoint[axis] = gl.camPos[axis]
             + f[axis] * kViewmodelForwardOffset + r[axis] * kViewmodelRightOffset
             - u[axis] * kViewmodelDownOffset;
+    }
+    if (gl.worldHasFireSound) {
+        KisakAudioPlayClip(
+            gl.worldFireSoundSamples.data(), gl.worldFireSoundSamples.size(),
+            gl.worldFireSoundChannels, gl.worldFireSoundRate
+        );
     }
 
     if (hit.valid) {

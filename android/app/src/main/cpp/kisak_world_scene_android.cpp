@@ -714,6 +714,101 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
         scene.viewmodelSurfaces = mesh.surfaces;
         scene.hasViewmodel = true;
         scene.viewmodelWeaponName = zone.weapons[w];
+
+        // Fire sound: fireSoundPlayer (WeaponDef) -> alias name -> the
+        // alias's first in-memory clip -> that clip's own bytes in
+        // zone.loadedSounds. Falls back to the plain fireSound ("_npc"/
+        // world-heard variant) when the player alias isn't in THIS zone's
+        // own directory — per-map zones don't necessarily bundle every
+        // alias the weapon references, some live in a shared code zone this
+        // port doesn't load for gameplay. Only WAVE_FORMAT_PCM (format 1),
+        // 8- or 16-bit, is decoded — this port has no ADPCM decoder, and
+        // the actual format value is logged either way.
+        const auto findAlias = [&](const std::string& name) -> const KisakLoadedSoundAlias* {
+            for (const KisakLoadedSoundAlias& candidate : zone.soundAliases) {
+                // Cross-zone shared asset references serialize with a
+                // leading comma in this engine's convention (same as
+                // techset/image names elsewhere in this port) — an alias
+                // list that's just a placeholder shell for another zone's
+                // real definition, not local audio data.
+                const std::string& candidateName = candidate.name;
+                const bool matches = candidateName == name
+                    || (!candidateName.empty() && candidateName.front() == ','
+                        && candidateName.compare(1, std::string::npos, name) == 0);
+                if (matches) {
+                    return &candidate;
+                }
+            }
+            return nullptr;
+        };
+        const auto findClip = [&](const std::string& name) -> const KisakLoadedSound* {
+            for (const KisakLoadedSound& candidate : zone.loadedSounds) {
+                if (candidate.name == name) {
+                    return &candidate;
+                }
+            }
+            return nullptr;
+        };
+        std::string fireSoundName;
+        if (w < zone.weaponFireSoundNames.size() && !zone.weaponFireSoundNames[w].empty()) {
+            fireSoundName = zone.weaponFireSoundNames[w];
+        }
+        const KisakLoadedSoundAlias* alias = fireSoundName.empty() ? nullptr : findAlias(fireSoundName);
+        if (alias == nullptr && w < zone.weaponFireSoundNpcNames.size()
+            && !zone.weaponFireSoundNpcNames[w].empty()) {
+            fireSoundName = zone.weaponFireSoundNpcNames[w];
+            alias = findAlias(fireSoundName);
+        }
+        const KisakLoadedSound* clip =
+            (alias != nullptr && !alias->loadedSoundNames.empty())
+                ? findClip(alias->loadedSoundNames.front())
+                : nullptr;
+        if (clip != nullptr && clip->format == 1 && clip->channels > 0 && clip->rate > 0
+            && !clip->data.empty()) {
+            if (clip->bits == 16) {
+                const size_t sampleCount = clip->data.size() / 2;
+                scene.fireSoundSamples.resize(sampleCount);
+                std::memcpy(scene.fireSoundSamples.data(), clip->data.data(), sampleCount * 2);
+                scene.hasFireSound = true;
+            } else if (clip->bits == 8) {
+                // Standard WAV 8-bit PCM is unsigned, midpoint 128.
+                scene.fireSoundSamples.resize(clip->data.size());
+                for (size_t i = 0; i < clip->data.size(); ++i) {
+                    scene.fireSoundSamples[i] =
+                        static_cast<int16_t>((static_cast<int>(clip->data[i]) - 128) * 256);
+                }
+                scene.hasFireSound = true;
+            }
+            if (scene.hasFireSound) {
+                scene.fireSoundChannels = clip->channels;
+                scene.fireSoundRate = static_cast<int>(clip->rate);
+            }
+        }
+        if (clip != nullptr) {
+            scene.fireSoundDiagnostic =
+                "clip=" + clip->name + " format=" + std::to_string(clip->format)
+                + " bits=" + std::to_string(clip->bits) + " rate=" + std::to_string(clip->rate)
+                + " channels=" + std::to_string(clip->channels)
+                + " bytes=" + std::to_string(clip->data.size());
+        } else if (alias != nullptr && !alias->streamedSoundPaths.empty()) {
+            // Streamed variant (the common case for SP weapon fire sounds —
+            // a real .wav on the VFS, not embedded inline). Reading and
+            // parsing happens in InitWorldScene, same as world textures; the
+            // scene builder just hands over the path.
+            scene.fireSoundStreamedPath = alias->streamedSoundPaths.front();
+            scene.fireSoundDiagnostic = "flux='" + scene.fireSoundStreamedPath + "'";
+        } else if (alias != nullptr) {
+            std::string variantNames;
+            for (const std::string& n : alias->loadedSoundNames) {
+                variantNames += (variantNames.empty() ? "" : ",") + n;
+            }
+            scene.fireSoundDiagnostic = "alias '" + alias->name + "' trouve, aliasCount="
+                + std::to_string(alias->aliasCount) + " loadedSoundNames=["
+                + (variantNames.empty() ? "(vide)" : variantNames) + "]";
+        } else if (!fireSoundName.empty()) {
+            scene.fireSoundDiagnostic = "alias '" + fireSoundName + "' introuvable parmi "
+                + std::to_string(zone.soundAliases.size()) + " alias de cette zone";
+        }
         break; // first usable weapon only — no loadout system yet
     }
 
@@ -1141,6 +1236,10 @@ std::string DescribeWorldScene(const KisakWorldScene& scene) {
             << scene.viewmodelIndices.size() / 3 << " tris)";
     } else {
         out << ", sans viewmodel";
+    }
+    if (!scene.fireSoundDiagnostic.empty()) {
+        out << ", tir audio: " << scene.fireSoundDiagnostic
+            << (scene.hasFireSound ? " (decode)" : " (NON decode)");
     }
     return out.str();
 }

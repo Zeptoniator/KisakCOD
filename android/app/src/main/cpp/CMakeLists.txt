@@ -14,6 +14,7 @@ add_library(kisakcod_android SHARED
     kisak_android.cpp
     kisak_android_fs_runtime.cpp
     kisak_android_native_renderer.cpp
+    kisak_audio_android.cpp
     kisak_cod4_filesystem_android.cpp
     kisak_cod4_virtual_file_android.cpp
     kisak_engine_filesystem_bridge_android.cpp
@@ -39,6 +40,7 @@ target_link_options(kisakcod_android PRIVATE
 target_link_libraries(kisakcod_android
     EGL
     GLESv3
+    aaudio
     android
     log
     z

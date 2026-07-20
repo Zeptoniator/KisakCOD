@@ -316,8 +316,8 @@ private:
     void LoadSndCurve(uint32_t structOffset);
     void LoadSpeakerMap(uint32_t structOffset);
     void LoadLoadedSound(uint32_t structOffset);
-    void LoadSoundFile(uint32_t structOffset);
-    void LoadSndAlias(uint32_t block, uint32_t aliasOffset);
+    void LoadSoundFile(uint32_t structOffset, KisakLoadedSoundAlias& alias);
+    void LoadSndAlias(uint32_t block, uint32_t aliasOffset, KisakLoadedSoundAlias& alias);
     void LoadSndAliasList(uint32_t structOffset);
     void LoadFont(uint32_t structOffset);
     void LoadGfxLightDef(uint32_t structOffset);
@@ -337,7 +337,7 @@ private:
     void LoadBrushWrapper(uint32_t structOffset);
     void LoadPhysGeomList(uint32_t structOffset);
     void LoadXModel(uint32_t structOffset);
-    void LoadXStringPtrSlot(uint32_t block, uint32_t slotOffset);
+    std::string LoadXStringPtrSlot(uint32_t block, uint32_t slotOffset);
     void LoadWeaponDef(uint32_t structOffset);
     void LoadStatement(uint32_t block, uint32_t stmtOffset);
     void LoadItemKeyHandlerChain(uint32_t block, uint32_t slotOffset);
@@ -786,6 +786,18 @@ void ZoneLoader::LoadLoadedSound(uint32_t structOffset) {
     PushStreamPos(4);
     LoadXString(reinterpret_cast<uint32_t*>(BlockAt(structBlock, structOffset)));
 
+    // MssSoundCOD4 fields, all read directly (not lazily via a resolved ref
+    // later) since the struct itself lives in the rewinding temp block just
+    // like the payload below.
+    KisakLoadedSound sound;
+    sound.name = ResolveString(ReadSlot(structBlock, structOffset));
+    std::memcpy(&sound.format, BlockAt(structBlock, structOffset + 4), 4);
+    std::memcpy(&sound.rate, BlockAt(structBlock, structOffset + 16), 4);
+    std::memcpy(&sound.bits, BlockAt(structBlock, structOffset + 20), 4);
+    std::memcpy(&sound.channels, BlockAt(structBlock, structOffset + 24), 4);
+    std::memcpy(&sound.samples, BlockAt(structBlock, structOffset + 28), 4);
+    std::memcpy(&sound.blockSize, BlockAt(structBlock, structOffset + 32), 4);
+
     PushStreamPos(0);
     const uint32_t dataValue = ReadSlot(structBlock, structOffset + 40);
     if (dataValue != 0) {
@@ -812,6 +824,11 @@ void ZoneLoader::LoadLoadedSound(uint32_t structOffset) {
                 Fail("donnees audio depassent le bloc " + std::to_string(posIndex_));
             } else {
                 LoadStream(true, BlockAt(posIndex_, dataOffset), dataLen);
+                // The payload lives in the rewinding temp block; keep a copy
+                // so consumers (playback) survive the walk, same reason
+                // GfxImage pixels get copied out.
+                sound.data.assign(
+                    BlockAt(posIndex_, dataOffset), BlockAt(posIndex_, dataOffset) + dataLen);
             }
             if (insertRef != 0) {
                 uint32_t index = 0;
@@ -827,27 +844,49 @@ void ZoneLoader::LoadLoadedSound(uint32_t structOffset) {
     PopStreamPos();
 
     if (!failed_) {
-        ++result_.loadedSoundCount;
+        result_.loadedSounds.push_back(std::move(sound));
     }
 }
 
 // Load_SoundFile: 12-byte struct {type, exists, u}; type 1 is a loaded
 // sound (asset-style slot), everything else a streamed dir/name pair.
-void ZoneLoader::LoadSoundFile(uint32_t structOffset) {
+// Links the owning alias variant to whichever it resolves to, in
+// loadedSoundNames or streamedSoundPaths.
+void ZoneLoader::LoadSoundFile(uint32_t structOffset, KisakLoadedSoundAlias& alias) {
     const uint32_t structBlock = posIndex_;
     LoadStream(true, BlockAt(structBlock, structOffset), 12);
     const uint8_t type = *BlockAt(structBlock, structOffset);
     if (type == 1) {
+        const size_t beforeCount = result_.loadedSounds.size();
         HandleAssetSlot(structBlock, structOffset + 4, &ZoneLoader::LoadLoadedSound, 44);
-    } else {
-        LoadXString(reinterpret_cast<uint32_t*>(BlockAt(structBlock, structOffset + 4)));
-        LoadXString(reinterpret_cast<uint32_t*>(BlockAt(structBlock, structOffset + 8)));
+        // A fresh load appends exactly one entry; an alias to an
+        // already-loaded clip appends none — in that case the name isn't
+        // recoverable here, but the shared clip is already in the vector
+        // under whichever alias first loaded it.
+        if (!failed_ && result_.loadedSounds.size() > beforeCount) {
+            alias.loadedSoundNames.push_back(result_.loadedSounds.back().name);
+        }
+        return;
+    }
+    LoadXString(reinterpret_cast<uint32_t*>(BlockAt(structBlock, structOffset + 4)));
+    LoadXString(reinterpret_cast<uint32_t*>(BlockAt(structBlock, structOffset + 8)));
+    if (failed_) {
+        return;
+    }
+    // Both fields were just resolved in place by the LoadXString calls
+    // above (they mutate the slot to a resolved ref, same convention as
+    // every other XString field in this port) — read them back the same
+    // way ResolveString(ReadSlot(...)) does elsewhere.
+    const std::string dir = ResolveString(ReadSlot(structBlock, structOffset + 4));
+    const std::string name = ResolveString(ReadSlot(structBlock, structOffset + 8));
+    if (!name.empty()) {
+        alias.streamedSoundPaths.push_back(dir.empty() ? ("sound/" + name) : ("sound/" + dir + "/" + name));
     }
 }
 
 // Load_snd_alias_t: 92-byte alias already bulk-read; four name strings,
 // then the sound file, falloff curve (asset-style) and speaker map.
-void ZoneLoader::LoadSndAlias(uint32_t block, uint32_t aliasOffset) {
+void ZoneLoader::LoadSndAlias(uint32_t block, uint32_t aliasOffset, KisakLoadedSoundAlias& alias) {
     for (uint32_t slot = 0; slot <= 12 && !failed_; slot += 4) {
         LoadXString(reinterpret_cast<uint32_t*>(BlockAt(block, aliasOffset + slot)));
     }
@@ -855,7 +894,7 @@ void ZoneLoader::LoadSndAlias(uint32_t block, uint32_t aliasOffset) {
     uint32_t inlineOffset = 0;
     if (ReadSlot(block, aliasOffset + 16) != 0
         && HandleInlinePtr(block, aliasOffset + 16, 3, inlineOffset)) {
-        LoadSoundFile(inlineOffset);
+        LoadSoundFile(inlineOffset, alias);
     }
     HandleAssetSlot(block, aliasOffset + 72, &ZoneLoader::LoadSndCurve, 72);
     if (ReadSlot(block, aliasOffset + 88) != 0
@@ -882,7 +921,7 @@ void ZoneLoader::LoadSndAliasList(uint32_t structOffset) {
         const uint32_t headBlock = posIndex_;
         LoadStream(true, BlockAt(headBlock, headOffset), alias.aliasCount * 92u);
         for (uint32_t i = 0; i < alias.aliasCount && !failed_; ++i) {
-            LoadSndAlias(headBlock, headOffset + i * 92u);
+            LoadSndAlias(headBlock, headOffset + i * 92u, alias);
         }
     }
     PopStreamPos();
@@ -1468,14 +1507,21 @@ void ZoneLoader::LoadXModel(uint32_t structOffset) {
 }
 
 // Load_XStringPtr / Load_snd_alias_list_name: pointer to a string pointer;
-// -1 allocates a 4-byte slot which is then handled as an XString.
-void ZoneLoader::LoadXStringPtrSlot(uint32_t block, uint32_t slotOffset) {
+// -1 allocates a 4-byte slot which is then handled as an XString. Returns
+// the resolved string (empty when the field was null/unset) so callers that
+// need the value (e.g. WeaponDef's fireSound alias name) don't have to
+// re-decode the double indirection themselves.
+std::string ZoneLoader::LoadXStringPtrSlot(uint32_t block, uint32_t slotOffset) {
     if (ReadSlot(block, slotOffset) == kPtrInline) {
         const uint32_t inner = AllocForSlot(block, slotOffset, 3);
         const uint32_t innerBlock = posIndex_;
         LoadStream(true, BlockAt(innerBlock, inner), 4);
         LoadXString(reinterpret_cast<uint32_t*>(BlockAt(innerBlock, inner)));
+        if (!failed_) {
+            return ResolveString(ReadSlot(innerBlock, inner));
+        }
     }
+    return {};
 }
 
 // Load_WeaponDef: 2168-byte struct; the pointer-field walk is generated
@@ -1535,6 +1581,24 @@ void ZoneLoader::LoadWeaponDef(uint32_t structOffset) {
         // gunXModel[16] at +12 was resolved in place by WD_MODEL_ARR above;
         // its first permutation is the base first-person view model.
         result_.weaponGunXModelRefs.push_back(ReadSlot(structBlock, structOffset + 12));
+        // fireSoundPlayer@372 (first-person clip the wielder hears) and
+        // fireSound@368 (the "_npc"/world-heard variant, kept as a fallback
+        // — per-map zones don't necessarily bundle the player variant's
+        // alias) were both resolved in place by WD_SND above (outer slot
+        // now holds the inner slot's ref, per LoadXStringPtrSlot) — read
+        // them back the same way that function itself would, without
+        // re-triggering its -1/allocate path again.
+        const auto resolveResolvedStringPtr = [&](uint32_t fieldOffset) -> std::string {
+            const uint32_t outer = ReadSlot(structBlock, structOffset + fieldOffset);
+            uint32_t index = 0;
+            uint32_t inner = 0;
+            if (outer != 0 && DecodeRef(outer, index, inner)) {
+                return ResolveString(ReadSlot(index, inner));
+            }
+            return {};
+        };
+        result_.weaponFireSoundNames.push_back(resolveResolvedStringPtr(372));
+        result_.weaponFireSoundNpcNames.push_back(resolveResolvedStringPtr(368));
     }
 }
 
@@ -2806,9 +2870,17 @@ std::string DescribeZoneLoad(const KisakZoneLoadResult& result) {
         << ", techsets=" << result.techniqueSets.size()
         << ", materials=" << result.materials.size()
         << ", images=" << result.images.size()
-        << ", sounds=" << result.soundAliases.size()
+        << ", sounds=" << result.soundAliases.size() << " (" << [&result] {
+            size_t withClip = 0;
+            for (const KisakLoadedSoundAlias& a : result.soundAliases) {
+                if (!a.loadedSoundNames.empty() || !a.streamedSoundPaths.empty()) {
+                    ++withClip;
+                }
+            }
+            return withClip;
+        }() << " resolus)"
         << ", sndcurves=" << result.soundCurveCount
-        << ", loadedsounds=" << result.loadedSoundCount
+        << ", loadedsounds=" << result.loadedSounds.size()
         << ", fonts=" << result.fonts.size()
         << ", menus=" << result.menus.size()
         << ", weapons=" << result.weapons.size()
