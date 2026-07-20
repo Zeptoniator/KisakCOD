@@ -352,3 +352,66 @@ leading-dot float literals. A block-comment-containing `switch`/`case`
 file (`ally_sas_woodland_smg_mp5.gsc`) tokenized its `switch`/`case`/
 `break` keywords correctly with the leading `/*QUAKED ...*/` doc-comment
 skipped cleanly.
+
+## Addendum — Step 7 findings (parser)
+
+Source: `plans/android-gscript-vm-port.md`, Step 7. Target script (per this
+step's own selection instruction — pick the simplest real script from
+Step 1): `character/character_sp_sas_ct_neal.gsc` — 2 functions, 6 lines of
+body, no control flow at all.
+
+`scr_parsetree.h`/`.cpp` confirmed (not assumed): retail's AST is a
+generic tagged N-ary node system — every node is `sval_u node[]` where
+`node[0].type` is an `Enum_t` tag and `node[1..8]` are child `sval_u`
+slots, bump-allocated via `Hunk_UserAlloc` (`node0`..`node8` helpers,
+`scr_parsetree.h:9-54`). This is NOT transliterated: a generic untyped
+8-slot record is exactly the kind of thing that's painful and error-prone
+to write and review in idiomatic C++. The new parser instead uses a
+kind-tagged struct (`KisakAstNodeKind` + named/positional
+`std::unique_ptr` children) — equivalent expressive power, still tracking
+`Enum_t`'s naming for the node kinds this subset actually produces
+(`If`/`While`/`For`/`Return`/... map to `ENUM_if`/`ENUM_while`/`ENUM_for`/
+`ENUM_return`).
+
+Real GSC method-call syntax confirmed pervasively in the corpus (e.g.
+`self setModel(...)`, `level.player setOrigin(...)`, `door playsound(...)`):
+`<object-expr> <bareword> ( args )` — **no dot** before the method name;
+dot is reserved for field access/assignment (`self.voice = "...";`). The
+parser has a dedicated `MethodCallExpr` production for this, disambiguated
+by one-token lookahead after a postfix (primary + `.field` chain)
+expression — a plain field-access chain followed immediately by `=` is an
+assignment, followed by `IDENTIFIER (` is a method call, anything else is
+just a field/identifier expression.
+
+Two real bugs found and fixed during host testing (not just synthetic
+edge cases — the first was hit by the ACTUAL target script):
+- `ParseExpressionOrAssignmentStatement` failed to consume the trailing
+  `;` when the result was an `Assignment` (only the wrapped-
+  `ExpressionStatement` branch did) — `self.voice = "british";` (line 5 of
+  the real target script) parsed the assignment correctly but left `;`
+  unconsumed, which then broke the NEXT statement's parse. Fixed by
+  consuming `;` on both branches.
+- Postfix `i++`/`i--` (confirmed real usage — `codescripts/character.gsc`)
+  wasn't handled at all — the grammar only had compound-assign (`+=` etc)
+  and prefix unary. Added as a `UnaryExpr` built at the same call site as
+  compound assignment, lowering the same way `OP_inc`/`OP_dec` already
+  work in step 3's VM.
+
+Grammar subset boundary confirmed genuinely enforced, not just documented:
+`switch` is rejected (unexpected keyword in expression position). Also
+discovered: **`self waittill(...)` is rejected too**, but not by an
+explicit check — `waittill` is lexed as a `Keyword` token (step 6), and
+this grammar's method-call production only recognizes `Identifier`-typed
+tokens as method names, so `waittill` can never satisfy the method-call
+lookahead. This is the correct behavior (waittill needs its own dedicated
+grammar production backed by the VM's dedicated `OP_waittill`, deferred to
+steps 8+), confirmed by test rather than assumed.
+
+Host validation: the real target script parses with 0 errors into the
+expected 2-function AST (full dump is this step's exit-criteria
+deliverable, in the commit message). A broader synthetic program exercising
+the full stated subset (assignment, if/else-if/else, while, for,
+arithmetic/comparison/logical operators, method calls, field access,
+postfix/prefix unary, bare calls, return) also parses cleanly into a
+correct AST — validates the broader baseline this step's context brief
+named, not just the minimal target.
