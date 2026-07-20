@@ -177,6 +177,14 @@ struct KisakScriptProgram {
     // instruction. Populated by the compiler (step 8); step 3's synthetic
     // test harness can also populate it by hand for hand-assembled tests.
     std::unordered_map<std::string, uint32_t> functionEntryPoints;
+    // String literal pool: OP_GetString's 2-byte operand indexes into this.
+    // A minimal stand-in for retail's global interned-string table (SL_*),
+    // introduced in step 4 (not step 2/3) because it's the first step whose
+    // own exit criteria need string literals at all (print/setdvar/getdvar
+    // arguments) — step 6+'s real lexer/compiler will populate this the same
+    // way a hand-assembled test does today; this is not meant to survive as
+    // the long-term string representation once a proper intern table exists.
+    std::vector<std::string> stringPool;
 };
 
 // Cursor over a KisakScriptProgram's bytecode buffer. Ports the reader
@@ -258,7 +266,8 @@ struct KisakScriptValue {
     // Mirrors Scr_CastBool: int -> (i != 0), float -> (f != 0). Callers must
     // check IsNumeric() first; non-numeric truthiness is a runtime error.
     bool Truthy() const;
-    std::string Describe() const;
+    std::string Describe() const;   // debug-tagged, e.g. int(14) — logs/tests only
+    std::string AsString() const;   // clean text form — print output, dvar values
 };
 
 enum class KisakScriptExecStatus : uint8_t {
@@ -300,3 +309,84 @@ struct KisakScriptVm {
     // and deterministic for host tests.
     uint64_t maxSteps = 100000000ull;
 };
+
+// ---------------------------------------------------------------------------
+// Step 4: builtin function dispatch (OP_CallBuiltin*) + a minimal builtin
+// table: print, println, isdefined, isstring, isarray, getdvar, getdvarint,
+// getdvarfloat, setdvar, assert, assertmsg — the lowest-dependency builtins
+// identified by this plan's research (g_scr_main.cpp:328-370). Anything that
+// pulls in entities/AI (spawn, getaiarray, ...) is explicitly out of scope
+// until step 5+ provides an entity model.
+//
+// Reference: functions[251] (g_scr_main.cpp:324, BuiltinFunctionDef — a
+// name + void(*)() pointer; the retail function reads its args off the VM's
+// global top-of-stack via Scr_GetInt/Scr_GetString/etc and optionally pushes
+// a return value via Scr_AddInt/Scr_AddString/etc) and the CallBuiltIn/
+// post_builtin dispatch machinery (scr_vm.cpp:2606-2712 — see also the
+// analogous case block starting ~1961, which is the OP_CallBuiltin path
+// inside a DIFFERENT setjmp-guarded switch and not relevant here).
+//
+// Key retail facts this step preserves: argcount comes from the opcode
+// variant (OP_CallBuiltin0..5 encode 0-5 directly; the generic OP_CallBuiltin
+// reads a 1-byte count) with a 2-byte builtinIndex operand following in BOTH
+// forms; Scr_GetInt(0)/Scr_GetString(0)/etc index args as top[-index], i.e.
+// index 0 = the LAST-PUSHED argument = conventionally the first syntactic
+// argument (so the compiler, step 8, must push arguments right-to-left —
+// noted here since step 8 will need this exact convention); if the builtin
+// doesn't push a return value, the VM pushes VAR_UNDEFINED so a builtin call
+// always leaves exactly one value on the stack.
+//
+// Deliberate deviation: builtinIndex resolves through OUR OWN small table
+// below (11 entries), NOT retail's combined 251+166-entry functions[]/
+// methods[] tables — there is no reason to replicate retail's full index
+// space for 11 builtins. Step 8's compiler must resolve builtin names to
+// indices into KisakScriptBuiltinTable(), not retail's numbering.
+
+// A builtin's view of its arguments: index 0 is the first syntactic
+// argument (matches Scr_GetInt(0) etc — see class comment above), regardless
+// of how the VM's internal value stack is ordered.
+struct KisakScriptBuiltinArgs {
+    const KisakScriptValue* values = nullptr;  // values[0] = first syntactic arg
+    uint32_t count = 0;
+
+    bool InRange(uint32_t index) const { return index < count; }
+    // Out-of-range/wrong-type access returns Undefined rather than crashing;
+    // builtins that require an argument (e.g. setdvar's name) explicitly
+    // check IsRange/type and call KisakScriptBuiltinCall::Fail themselves —
+    // mirrors Scr_GetString's own "parameter does not exist" script error,
+    // just surfaced through this step's result-code error model instead of
+    // longjmp.
+    const KisakScriptValue& Get(uint32_t index) const;
+};
+
+// A single builtin invocation's context: its arguments, its return value
+// (Undefined unless the builtin sets one — matches retail's post_builtin
+// "push VAR_UNDEFINED when nothing was added" behavior), and a way to raise
+// a script runtime error (this step's error model, not Scr_Error/longjmp).
+struct KisakScriptBuiltinCall {
+    KisakScriptBuiltinArgs args;
+    KisakScriptValue returnValue;  // Undefined by default
+    bool failed = false;
+    std::string failMessage;
+
+    void Fail(std::string message) {
+        failed = true;
+        failMessage = std::move(message);
+    }
+};
+
+using KisakScriptBuiltinFn = void (*)(KisakScriptBuiltinCall& call, KisakScriptLogFn log);
+
+struct KisakScriptBuiltinDef {
+    const char* name;
+    KisakScriptBuiltinFn fn;
+};
+
+// Fixed table, index-stable across a build (step 8's compiler embeds these
+// indices into bytecode) — print=0, println=1, isdefined=2, isstring=3,
+// isarray=4, getdvar=5, getdvarint=6, getdvarfloat=7, setdvar=8, assert=9,
+// assertmsg=10.
+const std::vector<KisakScriptBuiltinDef>& KisakScriptBuiltinTable();
+
+// -1 if no builtin has this name.
+int KisakScriptFindBuiltinIndex(const std::string& name);

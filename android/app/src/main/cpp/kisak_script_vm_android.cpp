@@ -1,7 +1,10 @@
 #include "kisak_script_vm_android.h"
 
+#include "kisak_menu_expression_android.h"
+
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(__ANDROID__)
@@ -280,6 +283,24 @@ std::string KisakScriptValue::Describe() const {
     return "<?>";
 }
 
+std::string KisakScriptValue::AsString() const {
+    char buf[64];
+    switch (type) {
+        case KisakScriptValueType::Undefined: return "";
+        case KisakScriptValueType::Int:
+            std::snprintf(buf, sizeof(buf), "%d", i);
+            return buf;
+        case KisakScriptValueType::Float:
+            std::snprintf(buf, sizeof(buf), "%g", f);
+            return buf;
+        case KisakScriptValueType::String: return s;
+        case KisakScriptValueType::CodePos:
+        case KisakScriptValueType::PreCodePos:
+            return "";
+    }
+    return "";
+}
+
 namespace {
 
 const char* const kLogTag = "KisakCODAndroid";
@@ -291,6 +312,137 @@ void DefaultLog(const std::string& line) {
     std::fprintf(stderr, "[%s] %s\n", kLogTag, line.c_str());
 #endif
 }
+
+}  // namespace
+
+const KisakScriptValue& KisakScriptBuiltinArgs::Get(uint32_t index) const {
+    static const KisakScriptValue kUndefined;
+    if (!InRange(index)) return kUndefined;
+    // `values` points at the base of the argument window in stack order
+    // (values[0] = oldest/first-pushed). Index 0 must mean the LAST-pushed
+    // value to match Scr_GetInt(0)'s top[-0] addressing (see the class
+    // comment in the header) — so this reverses, it doesn't index directly.
+    return values[count - 1 - index];
+}
+
+namespace {
+
+// ---- builtin implementations (g_scr_main.cpp:328-370) ----
+// Signature: void(KisakScriptBuiltinCall&, KisakScriptLogFn). `log` is
+// already resolved to DefaultLog by the dispatch site when the VM's own
+// logFn is null (see the OP_CallBuiltin* case), so builtins never need to
+// null-check it themselves.
+
+// print/println (g_scr_main.cpp:916-954): concatenate every argument's
+// text form and emit one line. Retail writes each arg without a separator
+// and println additionally trails a newline — DefaultLog/logFn already add
+// their own line framing, so this step just builds one joined string.
+void Builtin_Print(KisakScriptBuiltinCall& call, KisakScriptLogFn log) {
+    std::string line;
+    for (uint32_t i = 0; i < call.args.count; ++i) line += call.args.Get(i).AsString();
+    log(line);
+}
+
+void Builtin_Println(KisakScriptBuiltinCall& call, KisakScriptLogFn log) {
+    Builtin_Print(call, log);
+}
+
+// GScr_IsDefined (g_scr_main.cpp:1334): true for anything except undefined.
+// Retail's object-pointer-type carve-out (PointerType==19, a freed/invalid
+// object marker) doesn't apply — this VM has no entity/object type yet.
+void Builtin_IsDefined(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    call.returnValue = KisakScriptValue::Int(
+        call.args.Get(0).type != KisakScriptValueType::Undefined ? 1 : 0);
+}
+
+// GScr_IsString (g_scr_main.cpp:1360).
+void Builtin_IsString(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    call.returnValue = KisakScriptValue::Int(
+        call.args.Get(0).type == KisakScriptValueType::String ? 1 : 0);
+}
+
+// GScr_IsArray (g_scr_main.cpp:1368): always false — this trimmed VM has no
+// array/OP_EvalArray support yet (steps 8+), so nothing can ever produce an
+// array-typed value to test true.
+void Builtin_IsArray(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    call.returnValue = KisakScriptValue::Int(0);
+}
+
+// GScr_GetDvar (g_scr_main.cpp:1459): routed to the SAME dvar store the menu
+// expression evaluator already uses (kisak_menu_expression_android.h),
+// rather than a second store, per the plan's explicit instruction.
+void Builtin_GetDvar(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    if (!call.args.InRange(0)) { call.Fail("getdvar: missing name argument"); return; }
+    call.returnValue = KisakScriptValue::Str(GetKisakUiDvar(call.args.Get(0).AsString()));
+}
+
+// GScr_GetDvarInt (g_scr_main.cpp:1472): atol-equivalent over the stored
+// string value, "" (undefined dvar) parses as 0 like retail's atol("").
+void Builtin_GetDvarInt(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    if (!call.args.InRange(0)) { call.Fail("getdvarint: missing name argument"); return; }
+    call.returnValue = KisakScriptValue::Int(
+        std::atoi(GetKisakUiDvar(call.args.Get(0).AsString()).c_str()));
+}
+
+// GScr_GetDvarFloat (g_scr_main.cpp:1484).
+void Builtin_GetDvarFloat(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    if (!call.args.InRange(0)) { call.Fail("getdvarfloat: missing name argument"); return; }
+    call.returnValue = KisakScriptValue::Float(
+        static_cast<float>(std::atof(GetKisakUiDvar(call.args.Get(0).AsString()).c_str())));
+}
+
+// GScr_SetDvar (g_scr_main.cpp:1539): trimmed to the common single-value-arg
+// case (name, value). Retail additionally concatenates args 1..N-1 with
+// spaces via Scr_ConstructMessageString when arg 1 is itself a string
+// literal built from multiple tokens — that multi-token-message path isn't
+// needed by any real .gsc excerpt in plans/gscript-real-source-notes.md, so
+// it's deliberately not ported; only the 2-arg form is supported here.
+void Builtin_SetDvar(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    if (!call.args.InRange(0)) { call.Fail("setdvar: missing name argument"); return; }
+    SetKisakUiDvar(call.args.Get(0).AsString(), call.args.Get(1).AsString());
+}
+
+// assertCmd (g_scr_main.cpp:1305): fails when arg 0 is falsy.
+void Builtin_Assert(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    if (!call.args.Get(0).Truthy()) call.Fail("assert fail");
+}
+
+// assertmsgCmd (g_scr_main.cpp:1324): unconditional — the CALLING script is
+// expected to guard it with its own if(), e.g. `if (!isDefined(x))
+// assertmsg("x is not defined");`. This is a faithful port, not a bug: the
+// decompiled retail function really does call Scr_Error() unconditionally.
+void Builtin_AssertMsg(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
+    call.Fail("assert fail: " + call.args.Get(0).AsString());
+}
+
+}  // namespace
+
+const std::vector<KisakScriptBuiltinDef>& KisakScriptBuiltinTable() {
+    static const std::vector<KisakScriptBuiltinDef> table = {
+        {"print", &Builtin_Print},
+        {"println", &Builtin_Println},
+        {"isdefined", &Builtin_IsDefined},
+        {"isstring", &Builtin_IsString},
+        {"isarray", &Builtin_IsArray},
+        {"getdvar", &Builtin_GetDvar},
+        {"getdvarint", &Builtin_GetDvarInt},
+        {"getdvarfloat", &Builtin_GetDvarFloat},
+        {"setdvar", &Builtin_SetDvar},
+        {"assert", &Builtin_Assert},
+        {"assertmsg", &Builtin_AssertMsg},
+    };
+    return table;
+}
+
+int KisakScriptFindBuiltinIndex(const std::string& name) {
+    const auto& table = KisakScriptBuiltinTable();
+    for (size_t i = 0; i < table.size(); ++i) {
+        if (name == table[i].name) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+namespace {
 
 // A single called-into script function's activation: its return cursor and its
 // own local-variable slots. Locals are addressed newest-first to match retail's
@@ -509,18 +661,25 @@ void Interpreter::Run() {
             case KisakScriptOpcode::OP_GetFloat:
                 push(KisakScriptValue::Float(cursor.ReadFloat()));
                 break;
-            // Retail encodes strings as a 2-byte string-table id; this trimmed
-            // VM has no string table yet, so a compiled program can't reach here.
-            // Hand-assembled tests push strings via the assembler's literal pool
-            // (encoded as the id, resolved by the harness), but the core VM keeps
-            // the id as the int payload of a String only when a table exists.
-            // Until step 6+ provides one, OP_GetString is out of subset.
-            case KisakScriptOpcode::OP_GetString:
-                Fail(KisakScriptExecStatus::UnsupportedOpcode,
-                     "OP_GetString needs a string table (step 6+)");
-                result.stopPos = opPos;
-                result.stopOpcode = opcode;
-                return;
+            // Retail encodes strings as a 2-byte string-table id (SL_* intern
+            // table). This trimmed VM has no real intern table yet — step 4
+            // adds KisakScriptProgram::stringPool as a minimal stand-in
+            // (indexed the same way) because print/setdvar/getdvar, this
+            // step's own exit criteria, need string literals to be testable
+            // at all. Out-of-range ids are a malformed program, not a script
+            // runtime condition — a hand-assembled test or step 8's future
+            // compiler bug, so this is a RuntimeError like any other.
+            case KisakScriptOpcode::OP_GetString: {
+                uint16_t id = cursor.ReadUnsignedShort();
+                if (id >= program.stringPool.size()) {
+                    RuntimeError("OP_GetString: id " + std::to_string(id) +
+                                 " out of range (pool size " +
+                                 std::to_string(program.stringPool.size()) + ")");
+                    return;
+                }
+                push(KisakScriptValue::Str(program.stringPool[id]));
+                break;
+            }
 
             // ---- locals ----
             case KisakScriptOpcode::OP_CreateLocalVariable:
@@ -800,6 +959,47 @@ void Interpreter::Run() {
                 break;
             }
 
+            // ---- builtin function call (step 4) ----
+            // Reference: CallBuiltIn/post_builtin (scr_vm.cpp:2606-2712). The
+            // 0-5 opcode variants encode argcount directly; the generic form
+            // reads a 1-byte count. Both then read a 2-byte builtinIndex —
+            // into OUR OWN small table (KisakScriptBuiltinTable), NOT
+            // retail's combined functions[]/methods[] tables, see the header
+            // comment above KisakScriptBuiltinDef for why. Args are the top
+            // `argcount` stack values, index 0 = the LAST-PUSHED value,
+            // matching Scr_GetInt(0)'s top[-0] indexing (see header comment
+            // — step 8's compiler must push args right-to-left to match).
+            case KisakScriptOpcode::OP_CallBuiltin0:
+            case KisakScriptOpcode::OP_CallBuiltin1:
+            case KisakScriptOpcode::OP_CallBuiltin2:
+            case KisakScriptOpcode::OP_CallBuiltin3:
+            case KisakScriptOpcode::OP_CallBuiltin4:
+            case KisakScriptOpcode::OP_CallBuiltin5:
+            case KisakScriptOpcode::OP_CallBuiltin: {
+                uint32_t argCount = (opcode == KisakScriptOpcode::OP_CallBuiltin)
+                    ? cursor.ReadByte()
+                    : static_cast<uint8_t>(opcode) -
+                          static_cast<uint8_t>(KisakScriptOpcode::OP_CallBuiltin0);
+                uint16_t builtinIndex = cursor.ReadUnsignedShort();
+                const auto& table = KisakScriptBuiltinTable();
+                if (builtinIndex >= table.size()) {
+                    RuntimeError("call to unknown builtin index " + std::to_string(builtinIndex));
+                    return;
+                }
+                if (stack.size() < argCount) { RuntimeError("builtin call stack underflow"); return; }
+
+                KisakScriptBuiltinCall call;
+                call.args.values = stack.data() + (stack.size() - argCount);
+                call.args.count = argCount;
+                table[builtinIndex].fn(call, logFn ? logFn : DefaultLog);
+
+                for (uint32_t i = 0; i < argCount; ++i) pop();
+                if (call.failed) { RuntimeError(call.failMessage); return; }
+                push(std::move(call.returnValue));  // Undefined by default — matches
+                                                     // retail always leaving one value
+                break;
+            }
+
             case KisakScriptOpcode::OP_NOP:
                 break;
             case KisakScriptOpcode::OP_abort:
@@ -809,10 +1009,10 @@ void Interpreter::Run() {
                 halted = true;
                 return;
 
-            // Everything else (entity fields, OP_CallBuiltin*, waittill/notify/
-            // endon/wait/switch/threading, ...) is out of step 3's subset. Log
-            // exactly what was hit and where, then STOP — never silently no-op,
-            // so step 4/8 get a precise signal about what is still missing.
+            // Everything else (entity fields, waittill/notify/endon/wait/
+            // switch/threading, ...) is out of this VM's implemented subset.
+            // Log exactly what was hit and where, then STOP — never silently
+            // no-op, so step 8+ get a precise signal about what is missing.
             default: {
                 std::string msg = "unsupported opcode " + DescribeScriptOpcode(opcode) +
                     " (0x" + [&] {
