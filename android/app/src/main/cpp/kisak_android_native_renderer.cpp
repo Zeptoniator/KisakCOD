@@ -922,6 +922,11 @@ void StartWorldLoad(const std::string& mapName) {
             mapName.c_str(),
             DescribeWorldScene(*scene).c_str()
         );
+        if (!scene->step5EntityDiag.empty()) {
+            // GScript blueprint step 5 diagnostic (kisak_script_entity_android.h)
+            __android_log_print(ANDROID_LOG_INFO, kLogTag,
+                "Step5 spawn diag '%s': %s", mapName.c_str(), scene->step5EntityDiag.c_str());
+        }
         {
             std::lock_guard<std::mutex> lock(g_worldLoadMutex);
             g_pendingWorldScene = std::move(scene);

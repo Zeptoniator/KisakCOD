@@ -155,6 +155,13 @@ struct KisakWorldScene {
     float spawnOrigin[3] = {0.0f, 0.0f, 0.0f};
     float spawnYaw = 0.0f;
     std::string error;
+    // GScript blueprint (plans/android-gscript-vm-port.md) step 5 diagnostic:
+    // read-only comparison of SpawnEntitiesFromMapEntsString's output
+    // (kisak_script_entity_android.h) against this file's own
+    // ParseModelEntities for the SAME raw map_ents text — does not feed any
+    // other field on this struct or change rendering in any way. See the
+    // step 5 findings note in plans/gscript-real-source-notes.md.
+    std::string step5EntityDiag;
 };
 
 KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone);

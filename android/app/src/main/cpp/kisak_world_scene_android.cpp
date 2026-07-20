@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <sstream>
 
 #include "kisak_iwi_texture_android.h"
+#include "kisak_script_entity_android.h"
 
 namespace {
 constexpr uint32_t kAssetTypeXModel = 0x03;
@@ -833,6 +835,45 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
                 reinterpret_cast<const char*>(view.Ptr(entityString)), entityChars - 1);
             ParseSpawnPoint(entities, scene);
             ParseModelEntities(entities, entityModels);
+
+            // Step 5 diagnostic (see header comment on step5EntityDiag):
+            // does NOT feed entityModels or anything else below — read-only.
+            const std::vector<KisakScriptEntity> scriptEntities =
+                SpawnEntitiesFromMapEntsString(entities);
+            uint32_t newPathScriptModels = 0;
+            for (const auto& e : scriptEntities) {
+                if (e.handler == KisakEntityHandler::ScriptModel) ++newPathScriptModels;
+            }
+            char diagBuf[256];
+            const char* posNote = "";
+            bool positionsMatch = true;
+            if (newPathScriptModels == entityModels.size()) {
+                // entityModels order == scan order == scriptEntities' script_model
+                // subset order (both scan the same text top-to-bottom), so a
+                // direct index walk is a valid position comparison.
+                size_t si = 0;
+                for (size_t i = 0; i < entityModels.size() && positionsMatch; ++i) {
+                    while (si < scriptEntities.size() &&
+                           scriptEntities[si].handler != KisakEntityHandler::ScriptModel) {
+                        ++si;
+                    }
+                    if (si >= scriptEntities.size()) { positionsMatch = false; break; }
+                    for (int axis = 0; axis < 3; ++axis) {
+                        if (std::fabs(entityModels[i].origin[axis] - scriptEntities[si].origin[axis]) > 0.01f) {
+                            positionsMatch = false;
+                            break;
+                        }
+                    }
+                    ++si;
+                }
+                posNote = positionsMatch ? " positions=identiques" : " positions=DIFFERENTES";
+            } else {
+                posNote = " (nombres differents, positions non comparees)";
+            }
+            std::snprintf(diagBuf, sizeof(diagBuf),
+                "ancien(script_model+misc_model)=%zu nouveau(%s)%s",
+                entityModels.size(), DescribeScriptEntities(scriptEntities).c_str(), posNote);
+            scene.step5EntityDiag = diagBuf;
         }
     }
     if (!scene.hasSpawn) {

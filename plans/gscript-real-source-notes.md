@@ -255,3 +255,49 @@ load on the parser is not control-flow complexity but sheer breadth of flat
 `precacheX(...)` call sequences (killhouse.gsc's `main()` alone issues over
 140 sequential `precacheString` calls) — a good stress case for Step 2/3's
 lexer+parser throughput, not a syntax-coverage risk.
+
+## Addendum — Step 5 findings (minimal entity + spawn dispatch)
+
+Source: `plans/android-gscript-vm-port.md`, Step 5. The plan's own summary
+of `gentity_s`'s location was explicitly flagged as unconfirmed; grepping
+the reference tree directly overturned it.
+
+- **`gentity_s` is NOT in `g_local.h`/`g_shared.h`** — `g_shared.h` doesn't
+  exist anywhere in this tree, and `g_local.h` only forward-uses the type.
+  The real definition is `src/bgame/bg_public.h:918` (the `#elif KISAK_SP`
+  branch of a `#if KISAK_MP / #elif KISAK_SP` split — the MP struct at
+  line 679 is a different, incompatible layout; grepping for `struct
+  gentity_s` without checking which `#if` branch you landed in will find
+  the wrong one).
+- `classname`/`target`/`targetname`/`script_linkName`/`script_noteworthy`
+  are `uint16_t` string-table ids on `gentity_s`, not `char*`.
+- Origin/angles are NOT direct fields — they live at
+  `gentity_s.s.lerp.pos.trBase[3]` / `gentity_s.s.lerp.apos.trBase[3]`
+  (`entityState_s::lerp` is a `LerpEntityState`, `src/qcommon/ent.h:174`;
+  `trajectory_t.trBase[3]`, `src/universal/q_shared.h:828` — standard
+  Quake-family resting-position convention).
+- **`misc_model` is not a real classname anywhere in `g_spawn.cpp`'s spawn
+  tables** (`s_bspOrDynamicSpawns`/`s_bspOnlySpawns`, g_spawn.cpp:45,71) —
+  only `script_model` is real. `ParseModelEntities`
+  (`kisak_world_scene_android.cpp`) scans for `misc_model` defensively
+  alongside `script_model`, but nothing in `G_CallSpawn`'s real dispatch
+  would ever route it anywhere. Confirmed harmless in practice: killhouse's
+  real map_ents produced 0 `misc_model` entities (the new classname-dispatch
+  path's `script_model` count matched `ParseModelEntities`' combined
+  `script_model`+`misc_model` count exactly — 38 == 38 — with identical
+  positions).
+- `fields_1` (g_spawn.cpp:18) is the generic spawn-var → field table used
+  by `G_ParseEntityFields` before a classname-specific spawn function runs:
+  classname/origin/model/spawnflags/target/targetname/count/health/dmg/
+  angles/script_linkname/script_noteworthy/maxhealth/anglelerprate/
+  activator. `SP_script_model` (`g_scr_mover.cpp:199`) and
+  `SP_trigger_multiple` (`g_trigger.cpp:111`, via `InitTrigger` →
+  `SV_SetBrushModel`) only need the subset unrelated to actors/items
+  (count/health/dmg/maxhealth are actor/item-only).
+- Device validation (killhouse.ff, real map_ents, 2026-07-20): the new
+  `SpawnEntitiesFromMapEntsString` path found 38 `script_model` + 59
+  `trigger_multiple` entities (97 total) against `ParseModelEntities`'
+  38 (`script_model`+`misc_model` combined) — exact count match on the
+  classname both handle, positions identical. World rendered with no
+  regression (255 static models / 12225 instances, matching the prior
+  session's baseline exactly).
