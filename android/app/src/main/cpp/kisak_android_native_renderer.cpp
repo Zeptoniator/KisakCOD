@@ -189,6 +189,15 @@ struct GlContext {
     GLint worldModelTextureUniform = -1;
     GLint worldModelAlphaRefUniform = -1;
     std::vector<WorldModelDraw> worldModels;
+    // First-person weapon viewmodel (static milestone: no anim/firing yet).
+    // Own mesh pool, drawn with the SAME instanced program as static models
+    // but with a single instance transform recomputed from the camera every
+    // frame (glBufferSubData) instead of a baked one.
+    bool worldHasViewmodel = false;
+    GLuint worldViewmodelVbo = 0;
+    GLuint worldViewmodelIbo = 0;
+    GLuint worldViewmodelInstanceVbo = 0;
+    std::vector<WorldDrawRun> worldViewmodelSurfaces;
     std::map<std::string, GLuint> worldTextureCache;
     std::string worldName;
     float camPos[3] = {0.0f, 0.0f, 0.0f};
@@ -1001,6 +1010,20 @@ void DestroyWorldSceneResources(GlContext& gl) {
         gl.worldModelProgram = 0;
     }
     gl.worldModels.clear();
+    if (gl.worldViewmodelVbo != 0) {
+        glDeleteBuffers(1, &gl.worldViewmodelVbo);
+        gl.worldViewmodelVbo = 0;
+    }
+    if (gl.worldViewmodelIbo != 0) {
+        glDeleteBuffers(1, &gl.worldViewmodelIbo);
+        gl.worldViewmodelIbo = 0;
+    }
+    if (gl.worldViewmodelInstanceVbo != 0) {
+        glDeleteBuffers(1, &gl.worldViewmodelInstanceVbo);
+        gl.worldViewmodelInstanceVbo = 0;
+    }
+    gl.worldViewmodelSurfaces.clear();
+    gl.worldHasViewmodel = false;
     for (auto& [name, texture] : gl.worldTextureCache) {
         if (texture != 0) {
             glDeleteTextures(1, &texture);
@@ -1181,13 +1204,17 @@ bool InitWorldScene(GlContext& gl, const KisakWorldScene& scene) {
     }
 
     // Static models: shared mesh pool + per-instance transforms, drawn with
-    // glDrawElementsInstanced.
-    if (!scene.modelVertices.empty() && !scene.models.empty()) {
+    // glDrawElementsInstanced. The viewmodel below reuses this same program,
+    // so create it whenever either is present.
+    if ((!scene.modelVertices.empty() && !scene.models.empty()) || scene.hasViewmodel) {
         gl.worldModelProgram = CreateWorldModelProgram();
         if (gl.worldModelProgram != 0) {
             gl.worldModelMvpUniform = glGetUniformLocation(gl.worldModelProgram, "uMvp");
             gl.worldModelTextureUniform = glGetUniformLocation(gl.worldModelProgram, "uTexture");
             gl.worldModelAlphaRefUniform = glGetUniformLocation(gl.worldModelProgram, "uAlphaRef");
+        }
+    }
+    if (gl.worldModelProgram != 0 && !scene.modelVertices.empty() && !scene.models.empty()) {
             glGenBuffers(1, &gl.worldModelVbo);
             glBindBuffer(GL_ARRAY_BUFFER, gl.worldModelVbo);
             glBufferData(
@@ -1231,7 +1258,49 @@ bool InitWorldScene(GlContext& gl, const KisakWorldScene& scene) {
                 }
                 gl.worldModels.push_back(std::move(draw));
             }
+    }
+
+    // First-person weapon viewmodel (static milestone): own mesh pool, one
+    // dynamic instance transform recomputed from the camera every frame.
+    if (gl.worldModelProgram != 0 && scene.hasViewmodel && !scene.viewmodelVertices.empty()) {
+        glGenBuffers(1, &gl.worldViewmodelVbo);
+        glBindBuffer(GL_ARRAY_BUFFER, gl.worldViewmodelVbo);
+        glBufferData(
+            GL_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(scene.viewmodelVertices.size() * sizeof(float)),
+            scene.viewmodelVertices.data(),
+            GL_STATIC_DRAW
+        );
+        glGenBuffers(1, &gl.worldViewmodelIbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl.worldViewmodelIbo);
+        glBufferData(
+            GL_ELEMENT_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(scene.viewmodelIndices.size() * sizeof(uint32_t)),
+            scene.viewmodelIndices.data(),
+            GL_STATIC_DRAW
+        );
+        glGenBuffers(1, &gl.worldViewmodelInstanceVbo);
+        glBindBuffer(GL_ARRAY_BUFFER, gl.worldViewmodelInstanceVbo);
+        glBufferData(GL_ARRAY_BUFFER, 12 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+        gl.worldViewmodelSurfaces.clear();
+        for (const KisakWorldDrawSurface& surface : scene.viewmodelSurfaces) {
+            gl.worldViewmodelSurfaces.push_back({
+                surface.textureIndex, surface.lightmapIndex,
+                surface.firstIndex, surface.indexCount,
+                surface.alphaTestRef, surface.blended,
+                surface.srcBlend, surface.dstBlend, surface.cullNone,
+                false,
+            });
         }
+        gl.worldHasViewmodel = true;
+        __android_log_print(
+            ANDROID_LOG_INFO,
+            kLogTag,
+            "Viewmodel '%s': %zu sommets, %zu surfaces",
+            scene.viewmodelWeaponName.c_str(),
+            scene.viewmodelVertices.size() / 9,
+            gl.worldViewmodelSurfaces.size()
+        );
     }
 
     // Sky cubemap + program.
@@ -1571,6 +1640,80 @@ void DrawWorldScene(GlContext& gl) {
         }
     };
 
+    // First-person weapon viewmodel: camera-relative offset, always faces
+    // forward with the camera (static milestone — no sway/animation/firing
+    // yet). Local X = forward (muzzle), Y = left, Z = up, matching this
+    // engine's own Z-up world convention. Squeezed into a near depth-range
+    // sliver (not a depth clear, which would erase the opaque geometry the
+    // upcoming blended pass still needs to test against) so it always draws
+    // on top without disturbing the rest of the frame.
+    const auto drawViewmodel = [&]() {
+        if (!gl.worldHasViewmodel || gl.worldModelProgram == 0) {
+            return;
+        }
+        constexpr float kForwardOffset = 14.0f;
+        constexpr float kRightOffset = 6.0f;
+        constexpr float kDownOffset = 10.0f;
+        const float instance[12] = {
+            f[0], f[1], f[2],
+            -r[0], -r[1], -r[2],
+            u[0], u[1], u[2],
+            pos[0] + f[0] * kForwardOffset + r[0] * kRightOffset - u[0] * kDownOffset,
+            pos[1] + f[1] * kForwardOffset + r[1] * kRightOffset - u[1] * kDownOffset,
+            pos[2] + f[2] * kForwardOffset + r[2] * kRightOffset - u[2] * kDownOffset,
+        };
+        glUseProgram(gl.worldModelProgram);
+        glUniformMatrix4fv(gl.worldModelMvpUniform, 1, GL_FALSE, mvp);
+        glUniform1i(gl.worldModelTextureUniform, 0);
+        glBindBuffer(GL_ARRAY_BUFFER, gl.worldViewmodelInstanceVbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(instance), instance);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gl.worldViewmodelIbo);
+        glBindBuffer(GL_ARRAY_BUFFER, gl.worldViewmodelVbo);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 9 * sizeof(float), nullptr);
+        glVertexAttribPointer(
+            1, 2, GL_FLOAT, GL_FALSE, 9 * sizeof(float),
+            reinterpret_cast<const void*>(3 * sizeof(float))
+        );
+        glVertexAttribPointer(
+            2, 4, GL_FLOAT, GL_FALSE, 9 * sizeof(float),
+            reinterpret_cast<const void*>(5 * sizeof(float))
+        );
+        glBindBuffer(GL_ARRAY_BUFFER, gl.worldViewmodelInstanceVbo);
+        for (GLuint attrib = 3; attrib <= 6; ++attrib) {
+            glEnableVertexAttribArray(attrib);
+            glVertexAttribDivisor(attrib, 1);
+            glVertexAttribPointer(
+                attrib, 3, GL_FLOAT, GL_FALSE, 12 * sizeof(float),
+                reinterpret_cast<const void*>((attrib - 3) * 3 * sizeof(float))
+            );
+        }
+        float currentAlphaRef = -2.0f;
+        bool culling = false;
+        glDisable(GL_CULL_FACE);
+        glDepthRangef(0.0f, 0.1f);
+        for (const WorldDrawRun& run : gl.worldViewmodelSurfaces) {
+            if (run.alphaTestRef != currentAlphaRef) {
+                currentAlphaRef = run.alphaTestRef;
+                glUniform1f(gl.worldModelAlphaRefUniform, currentAlphaRef);
+            }
+            applyRunCull(run.cullNone, culling);
+            bindRunTexture(run);
+            glDrawElementsInstanced(
+                GL_TRIANGLES,
+                static_cast<GLsizei>(run.indexCount),
+                GL_UNSIGNED_INT,
+                reinterpret_cast<const void*>(static_cast<uintptr_t>(run.firstIndex) * 4),
+                1
+            );
+        }
+        glDepthRangef(0.0f, 1.0f);
+        glDisable(GL_CULL_FACE);
+        for (GLuint attrib = 3; attrib <= 6; ++attrib) {
+            glVertexAttribDivisor(attrib, 0);
+            glDisableVertexAttribArray(attrib);
+        }
+    };
+
     // Sky pass: drawn after opaque geometry with depth pinned to the far
     // plane, so only visible sky pixels sample the cubemap.
     const auto drawWorldSky = [&]() {
@@ -1609,6 +1752,7 @@ void DrawWorldScene(GlContext& gl) {
     glEnableVertexAttribArray(2);
     drawWorldRuns(false);
     drawWorldModels(false);
+    drawViewmodel();
     drawWorldSky();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);

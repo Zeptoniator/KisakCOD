@@ -1532,6 +1532,9 @@ void ZoneLoader::LoadWeaponDef(uint32_t structOffset) {
     PopStreamPos();
     if (!failed_) {
         result_.weapons.push_back(ResolveString(ReadSlot(structBlock, structOffset)));
+        // gunXModel[16] at +12 was resolved in place by WD_MODEL_ARR above;
+        // its first permutation is the base first-person view model.
+        result_.weaponGunXModelRefs.push_back(ReadSlot(structBlock, structOffset + 12));
     }
 }
 

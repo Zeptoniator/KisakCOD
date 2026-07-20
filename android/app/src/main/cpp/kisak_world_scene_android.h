@@ -106,6 +106,16 @@ struct KisakWorldScene {
     std::vector<uint32_t> modelIndices;
     std::vector<float> modelInstances;
     std::vector<KisakWorldModelMesh> models;
+    // First-person weapon viewmodel (milestone: static display only, no
+    // animation/firing yet) — the zone's first non-placeholder weapon's
+    // gunXModel[0], same 9-float vertex layout as modelVertices/Indices but
+    // kept in its own pool: unlike world props it needs a per-frame,
+    // camera-relative instance transform instead of a baked one.
+    bool hasViewmodel = false;
+    std::string viewmodelWeaponName;
+    std::vector<float> viewmodelVertices;
+    std::vector<uint32_t> viewmodelIndices;
+    std::vector<KisakWorldDrawSurface> viewmodelSurfaces;
     float mins[3] = {0.0f, 0.0f, 0.0f};
     float maxs[3] = {0.0f, 0.0f, 0.0f};
     float sunColor[3] = {1.0f, 1.0f, 0.9f};

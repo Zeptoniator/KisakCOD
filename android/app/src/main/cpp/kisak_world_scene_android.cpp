@@ -515,6 +515,83 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
         }
     }
 
+    // First-person weapon viewmodel (static display milestone: no
+    // animation/firing/loadout yet — just the zone's first usable weapon).
+    // Own vertex/index pool: unlike world props it needs a per-frame,
+    // camera-relative instance transform instead of a baked one, so it can't
+    // share modelVertices/modelInstances.
+    for (size_t w = 0; w < zone.weapons.size(); ++w) {
+        if (zone.weapons[w] == "none" || w >= zone.weaponGunXModelRefs.size()) {
+            continue;
+        }
+        const uint32_t model = zone.weaponGunXModelRefs[w];
+        if (!view.ValidRef(model, 220) || static_cast<int16_t>(view.U16(model, 196)) < 1) {
+            continue;
+        }
+        const uint16_t numsurfs = view.U16(model, 44);
+        const uint16_t surfIndex = view.U16(model, 46);
+        const uint32_t surfs = view.U32(model, 32);
+        const uint32_t materials = view.U32(model, 36);
+        if (numsurfs == 0 || !view.ValidRef(surfs, (surfIndex + numsurfs) * 56u)) {
+            continue;
+        }
+        for (uint16_t s = 0; s < numsurfs; ++s) {
+            // XSurface 56o: vertCount@2, triCount@4, triIndices@12, verts0@28
+            // (GfxPackedVertex 32o: xyz@0, color@16 BGRA, texCoord@20 half).
+            const uint32_t surf = (surfIndex + s) * 56u;
+            const uint16_t vertCount = view.U16(surfs, surf + 2);
+            const uint16_t triCount = view.U16(surfs, surf + 4);
+            const uint32_t triIndices = view.U32(surfs, surf + 12);
+            const uint32_t verts0 = view.U32(surfs, surf + 28);
+            if (vertCount == 0 || triCount == 0
+                || !view.ValidRef(verts0, vertCount * 32u)
+                || !view.ValidRef(triIndices, triCount * 6u)) {
+                continue;
+            }
+            const uint32_t baseVertex = static_cast<uint32_t>(scene.viewmodelVertices.size() / 9);
+            const uint8_t* vertexData = view.Ptr(verts0);
+            for (uint32_t vertex = 0; vertex < vertCount; ++vertex) {
+                const uint8_t* packed = vertexData + static_cast<size_t>(vertex) * 32;
+                float position[3];
+                std::memcpy(position, packed, 12);
+                const uint8_t* color = packed + 16;
+                uint16_t texCoord[2];
+                std::memcpy(texCoord, packed + 20, 4);
+                scene.viewmodelVertices.insert(scene.viewmodelVertices.end(), {
+                    position[0], position[1], position[2],
+                    HalfToFloat(texCoord[0]), HalfToFloat(texCoord[1]),
+                    color[2] / 255.0f, color[1] / 255.0f, color[0] / 255.0f, color[3] / 255.0f,
+                });
+            }
+            KisakWorldDrawSurface draw;
+            draw.firstIndex = static_cast<uint32_t>(scene.viewmodelIndices.size());
+            draw.indexCount = 3u * triCount;
+            uint32_t materialRef = 0;
+            if (view.ValidRef(materials, (surfIndex + s + 1u) * 4u)) {
+                materialRef = view.U32(materials, (surfIndex + s) * 4u);
+            }
+            const SurfaceState state = resolveSurfaceState(materialRef);
+            draw.textureIndex = state.textureIndex;
+            draw.alphaTestRef = state.alphaTestRef;
+            draw.blended = state.blended;
+            draw.srcBlend = state.srcBlend;
+            draw.dstBlend = state.dstBlend;
+            draw.cullNone = state.cullNone;
+            const uint8_t* localIndices = view.Ptr(triIndices);
+            for (uint32_t k = 0; k < 3u * triCount; ++k) {
+                uint16_t index = 0;
+                std::memcpy(&index, localIndices + static_cast<size_t>(k) * 2, 2);
+                scene.viewmodelIndices.push_back(baseVertex + index);
+            }
+            scene.viewmodelSurfaces.push_back(draw);
+        }
+        if (!scene.viewmodelSurfaces.empty()) {
+            scene.hasViewmodel = true;
+            scene.viewmodelWeaponName = zone.weapons[w];
+        }
+        break; // first usable weapon only — no loadout system yet
+    }
+
     // Spawn point from the map_ents entity string. map_ents rarely has its
     // own directory entry: it deserializes through the clipmap's mapEnts
     // slot (offset 164), so fall back to that path.
@@ -800,6 +877,13 @@ std::string DescribeWorldScene(const KisakWorldScene& scene) {
     if (scene.hasSpawn) {
         out << ", spawn=(" << scene.spawnOrigin[0] << "," << scene.spawnOrigin[1]
             << "," << scene.spawnOrigin[2] << ") yaw=" << scene.spawnYaw;
+    }
+    if (scene.hasViewmodel) {
+        out << ", viewmodel=" << scene.viewmodelWeaponName << " ("
+            << scene.viewmodelVertices.size() / 9 << " sommets, "
+            << scene.viewmodelIndices.size() / 3 << " tris)";
+    } else {
+        out << ", sans viewmodel";
     }
     return out.str();
 }

@@ -78,6 +78,12 @@ struct KisakZoneLoadResult {
     uint32_t loadedSoundCount = 0;
     std::vector<std::string> menus;
     std::vector<std::string> weapons;
+    // Parallel to weapons: each entry is the resolved zone-block reference to
+    // that weapon's gunXModel[0] (the first-person view model), or 0 if that
+    // permutation slot was empty. A KisakZoneView on the SAME zone can read
+    // it exactly like any other resolved XModel ref (e.g. GfxWorld's static
+    // prop instances).
+    std::vector<uint32_t> weaponGunXModelRefs;
     std::vector<std::string> xmodels;
     std::vector<std::string> stringTables;
     uint32_t xanimCount = 0;
