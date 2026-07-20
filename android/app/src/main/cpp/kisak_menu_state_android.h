@@ -69,6 +69,24 @@ bool KisakItemDynamicVisible(const KisakZoneLoadResult& zone, uint32_t itemRef);
 // hit-testing or focus.
 bool KisakItemIsDecoration(const KisakZoneLoadResult& zone, uint32_t itemRef);
 
+// fadein/fadeout script animation (Fade(), ui_shared.cpp:4970) for a style
+// FILLED window's background alpha — the menu's own background window when
+// windowRef == menuRef, or an item's window when windowRef == itemRef. Ticks
+// by wall-clock time so it stays correct however often the caller rebuilds
+// the scene. Returns true and fills *outAlpha when a fade is in progress (or
+// just completed) and its value should override the serialized backColor
+// alpha; *animating stays true while the fade still needs more ticking, so
+// the caller can keep requesting scene rebuilds until it settles.
+bool KisakMenuTickFadeAlpha(
+    const KisakZoneLoadResult& zone,
+    uint32_t menuRef,
+    uint32_t windowRef,
+    float serializedAlpha,
+    long long nowMs,
+    float* outAlpha,
+    bool* animating
+);
+
 // Engine-side effect of activating an interactive item (before its action
 // script runs): multi (0xC) cycles its dvar to the next entry, yesno (0xB)
 // toggles it, listbox (0x6) selects the row under the touch point. Returns

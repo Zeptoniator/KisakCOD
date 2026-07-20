@@ -428,6 +428,17 @@ struct SceneBuilder {
                 EmitRect(x, y, w, h, tint, TextureFor(image));
             }
         } else if (style == 1) {
+            float fadeAlpha = backColor[3];
+            bool fading = false;
+            const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (KisakMenuTickFadeAlpha(
+                    *menuZone, scene.menuRef, windowRef, backColor[3], nowMs, &fadeAlpha, &fading)) {
+                backColor[3] = fadeAlpha;
+            }
+            if (fading) {
+                scene.timeDependentExpressions = true;
+            }
             if (!image.empty()) {
                 EmitRect(x, y, w, h, backColor, TextureFor(image));
             } else if (backColor[3] > 0.01f) {

@@ -22,6 +22,14 @@ constexpr uint32_t kMenuItemCount = 164;
 constexpr uint32_t kMenuOnOpen = 196;
 constexpr uint32_t kMenuOnClose = 200;
 constexpr uint32_t kMenuItems = 280;
+// menuDef_t fade parameters (src/ui/ui_shared.h:504) — sit between itemCount
+// (164) and onOpen (196): font ptr@156, fullScreen@160, itemCount@164,
+// fontIndex@168, cursorItem[1]@172, fadeCycle@176, fadeClamp@180,
+// fadeAmount@184, fadeInAmount@188, blurRadius@192, onOpen@196.
+constexpr uint32_t kMenuFadeCycle = 176;
+constexpr uint32_t kMenuFadeClamp = 180;
+constexpr uint32_t kMenuFadeAmount = 184;
+constexpr uint32_t kMenuFadeInAmount = 188;
 
 // itemDef_s offsets.
 constexpr uint32_t kItemName = 0;
@@ -72,6 +80,16 @@ struct ListBoxState {
     int startPos = 0;
 };
 std::map<std::pair<const void*, uint32_t>, ListBoxState> g_listBoxState;
+// fadein/fadeout animation state (Fade(), ui_shared.cpp:4970), keyed by
+// {zone, windowRef} same as g_visibleOverrides — windowRef is the menu's own
+// ref for the menu background, or an itemRef for item backgrounds.
+struct FadeState {
+    bool fadingOut = false;
+    bool fadingIn = false;
+    float alpha = -1.0f; // < 0 == not yet primed from the serialized value
+    long long nextTimeMs = 0;
+};
+std::map<std::pair<const void*, uint32_t>, FadeState> g_fadeState;
 std::vector<std::shared_ptr<const KisakZoneLoadResult>> g_scriptZones;
 bool g_defaultControlsSeeded = false;
 std::string g_pendingLaunchCommand;
@@ -640,6 +658,45 @@ void ShowItemsByName(
     }
 }
 
+// Menu_FadeItemByName (ui_shared.cpp:906): starts (or reverses) a fade on
+// every item matching name/group. Both directions force the item visible —
+// fadeOut only hides it once its alpha reaches zero (see
+// KisakMenuTickFadeAlpha) — matching Window_AddDynamicFlags(..., 20/36).
+void FadeItemsByName(
+    const KisakZoneLoadResult& zone,
+    uint32_t menuRef,
+    const std::string& pattern,
+    bool fadeOut,
+    bool* stateChanged
+) {
+    KisakZoneView view(zone);
+    const size_t wildcard = pattern.find('*');
+    const uint32_t itemCount = view.U32(menuRef, kMenuItemCount);
+    const uint32_t items = view.U32(menuRef, kMenuItems);
+    for (uint32_t i = 0; i < itemCount; ++i) {
+        const uint32_t itemRef = view.U32(items, i * 4);
+        if (!view.ValidRef(itemRef, 372)) {
+            continue;
+        }
+        if (!NameMatches(view.StrAt(itemRef, kItemName), pattern, wildcard)
+            && !NameMatches(view.StrAt(itemRef, kItemGroup), pattern, wildcard)) {
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        const auto key = std::make_pair(static_cast<const void*>(&zone), itemRef);
+        FadeState& state = g_fadeState[key];
+        state.fadingOut = fadeOut;
+        state.fadingIn = !fadeOut;
+        state.nextTimeMs = 0; // tick immediately on the next scene build
+        const auto visIt = g_visibleOverrides.find(key);
+        if (visIt == g_visibleOverrides.end() || !visIt->second) {
+            g_visibleOverrides[key] = true;
+            *stateChanged = true;
+        }
+        *stateChanged = true; // (re)starting a fade always needs a rebuild
+    }
+}
+
 bool ItemVisibleForFocus(const KisakZoneLoadResult& zone, uint32_t itemRef) {
     if (!KisakItemDynamicVisible(zone, itemRef)) {
         return false;
@@ -857,7 +914,9 @@ void ResetKisakMenuForOpen(const KisakZoneLoadResult& zone, uint32_t menuRef) {
     for (uint32_t i = 0; i < itemCount; ++i) {
         const uint32_t itemRef = view.U32(items, i * 4);
         if (view.ValidRef(itemRef, 372)) {
-            g_visibleOverrides.erase(std::make_pair(static_cast<const void*>(&zone), itemRef));
+            const auto key = std::make_pair(static_cast<const void*>(&zone), itemRef);
+            g_visibleOverrides.erase(key);
+            g_fadeState.erase(key);
         }
     }
 }
@@ -920,6 +979,10 @@ KisakMenuScriptResult RunKisakMenuScript(
             i += 2;
         } else if (strcasecmp(cmd, "hide") == 0 || strcasecmp(cmd, "show") == 0) {
             ShowItemsByName(zone, menuRef, arg(1), strcasecmp(cmd, "show") == 0,
+                            &result.stateChanged);
+            ++i;
+        } else if (strcasecmp(cmd, "fadein") == 0 || strcasecmp(cmd, "fadeout") == 0) {
+            FadeItemsByName(zone, menuRef, arg(1), strcasecmp(cmd, "fadeout") == 0,
                             &result.stateChanged);
             ++i;
         } else if (strcasecmp(cmd, "savegameshow") == 0) {
@@ -1015,6 +1078,73 @@ bool KisakItemDynamicVisible(const KisakZoneLoadResult& zone, uint32_t itemRef) 
     }
     KisakZoneView view(zone);
     return (view.U32(itemRef, kItemDynamicFlags) & kWindowVisibleDynamic) != 0;
+}
+
+bool KisakMenuTickFadeAlpha(
+    const KisakZoneLoadResult& zone,
+    uint32_t menuRef,
+    uint32_t windowRef,
+    float serializedAlpha,
+    long long nowMs,
+    float* outAlpha,
+    bool* animating
+) {
+    *animating = false;
+    const auto key = std::make_pair(static_cast<const void*>(&zone), windowRef);
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    const auto it = g_fadeState.find(key);
+    if (it == g_fadeState.end() || (!it->second.fadingOut && !it->second.fadingIn)) {
+        return false;
+    }
+    FadeState& state = it->second;
+    if (state.alpha < 0.0f) {
+        state.alpha = serializedAlpha;
+    }
+
+    // Menu_Paint/Item_Paint always pass the OWNING MENU's fade parameters,
+    // even for item windows (ui_shared.cpp:5064) — every window in a menu
+    // shares one fade speed/cadence.
+    KisakZoneView view(zone);
+    const int fadeCycleMs = std::max(static_cast<int>(view.U32(menuRef, kMenuFadeCycle)), 1);
+    const float fadeClamp = view.F32(menuRef, kMenuFadeClamp);
+    const float fadeAmount = view.F32(menuRef, kMenuFadeAmount);
+    const float fadeInAmount = view.F32(menuRef, kMenuFadeInAmount);
+
+    // Fade() (ui_shared.cpp:4970) steps once per fadeCycle ms of wall-clock
+    // time; catch up however many intervals elapsed since the last tick so
+    // playback speed doesn't depend on how often the caller rebuilds.
+    int guard = 100000;
+    while (nowMs > state.nextTimeMs && guard-- > 0) {
+        state.nextTimeMs += fadeCycleMs;
+        if (state.fadingOut) {
+            if (fadeAmount <= 0.0f) {
+                state.alpha = 0.0f;
+            } else {
+                state.alpha -= fadeAmount;
+            }
+            if (state.alpha <= 0.0f) {
+                state.alpha = 0.0f;
+                state.fadingOut = false;
+                g_visibleOverrides[key] = false; // Fade(): clears WINDOW_VISIBLE too
+                break;
+            }
+        } else {
+            if (fadeInAmount <= 0.0f) {
+                state.alpha = fadeClamp;
+            } else {
+                state.alpha += fadeInAmount;
+            }
+            if (state.alpha >= fadeClamp) {
+                state.alpha = fadeClamp;
+                state.fadingIn = false;
+                break;
+            }
+        }
+    }
+
+    *outAlpha = state.alpha;
+    *animating = state.fadingOut || state.fadingIn;
+    return true;
 }
 
 bool KisakItemIsDecoration(const KisakZoneLoadResult& zone, uint32_t itemRef) {
