@@ -209,3 +209,94 @@ struct KisakScriptCursor {
 };
 
 std::string DescribeScriptOpcode(KisakScriptOpcode opcode);
+
+// ---------------------------------------------------------------------------
+// Step 3: runtime value type + bytecode executor.
+//
+// Reference: VM_ExecuteInternal (src/script/scr_vm.cpp:2123-3479, the REAL main
+// dispatch loop — NOT the two setjmp-guarded switches at 1823/1883, which are
+// error-recovery stack cleanup) and the operator helpers in scr_variable.cpp
+// (Scr_EvalPlus, Scr_CastWeakerPair, Scr_EvalEquality, ...). Only the entity-
+// and builtin-free opcode subset is ported here; step 4 adds OP_CallBuiltin*,
+// steps 8+ add entity fields / waittill / notify / switch / threading.
+// ---------------------------------------------------------------------------
+
+// GScript's runtime value type. This is a NEW type rather than a reuse of
+// KisakExprValue (kisak_menu_expression_android.h). KisakExprValue is an
+// Int/Float/String-only tagged struct built for the UI expression evaluator;
+// it cannot represent (a) VAR_UNDEFINED, which GScript needs as a first-class
+// runtime value (OP_GetUndefined, uninitialized locals, a function's default
+// return), nor (b) the two VM-internal stack markers the call/return machinery
+// relies on (a CodePos frame boundary and a PreCodePos argument delimiter).
+// Bolting those onto KisakExprValue would leak VM-internal concerns into the
+// unrelated UI evaluator. The two share a tagged-value philosophy but stay
+// decoupled. An entity-ref variant is intentionally deferred to the step that
+// first needs entities (step 5/9); adding it here would be dead weight.
+enum class KisakScriptValueType : uint8_t {
+    Undefined = 0,
+    Int,
+    Float,
+    String,
+    CodePos,     // internal marker: a script-function frame boundary on the stack
+    PreCodePos,  // internal marker: delimits the start of a call's arguments
+};
+
+struct KisakScriptValue {
+    KisakScriptValueType type = KisakScriptValueType::Undefined;
+    int32_t i = 0;
+    float f = 0.0f;
+    std::string s;
+
+    static KisakScriptValue Undefined();
+    static KisakScriptValue Int(int32_t v);
+    static KisakScriptValue Float(float v);
+    static KisakScriptValue Str(std::string v);
+    static KisakScriptValue Marker(KisakScriptValueType marker);
+
+    bool IsNumeric() const { return type == KisakScriptValueType::Int ||
+                                    type == KisakScriptValueType::Float; }
+    // Mirrors Scr_CastBool: int -> (i != 0), float -> (f != 0). Callers must
+    // check IsNumeric() first; non-numeric truthiness is a runtime error.
+    bool Truthy() const;
+    std::string Describe() const;
+};
+
+enum class KisakScriptExecStatus : uint8_t {
+    Completed,          // ran to a top-level OP_End/OP_Return
+    RuntimeError,       // a script-level error (type mismatch, divide by zero, ...)
+    UnsupportedOpcode,  // hit an opcode outside step 3's subset — stopped cleanly
+    Aborted,            // OP_abort
+};
+
+struct KisakScriptExecResult {
+    KisakScriptExecStatus status = KisakScriptExecStatus::Completed;
+    KisakScriptValue returnValue;               // meaningful when status == Completed
+    std::string message;                        // set for RuntimeError/UnsupportedOpcode
+    size_t stopPos = 0;                          // bytecode offset execution stopped at
+    KisakScriptOpcode stopOpcode = KisakScriptOpcode::OP_End;
+};
+
+// Sink for print/println-style output and diagnostics. nullptr routes to the
+// platform default (__android_log_print on device, stderr on host). Host tests
+// install their own sink to capture output.
+using KisakScriptLogFn = void (*)(const std::string& line);
+
+// The executor. Holds configuration only; all per-run state is local to
+// Execute() so a single instance can be reused across programs.
+//
+// Error model (decided here so later steps inherit it): a plain result code +
+// message, NOT setjmp/longjmp (retail's mechanism) and NOT C++ exceptions.
+// Rationale — the reference longjmp path exists to unwind a persistent global
+// VM stack and resume other script threads, neither of which this trimmed
+// single-thread executor has; a status enum is the smallest thing that lets
+// step 4/8 distinguish "script bug" from "opcode not implemented yet" without
+// exceptions-as-control-flow, which this codebase avoids.
+struct KisakScriptVm {
+    KisakScriptExecResult Execute(const KisakScriptProgram& program, uint32_t entryOffset);
+
+    KisakScriptLogFn logFn = nullptr;
+    // Guards against a runaway loop in a malformed test program. Retail uses a
+    // 5s wall-clock timeout (INFINITE_LOOP_TIMEOUT); a step budget is simpler
+    // and deterministic for host tests.
+    uint64_t maxSteps = 100000000ull;
+};
