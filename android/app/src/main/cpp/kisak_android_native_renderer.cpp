@@ -175,6 +175,41 @@ void AppendQuadOnPlane(const float point[3], const float normal[3], float size, 
     AppendQuad(point, tangent1, tangent2, size, out);
 }
 
+// Appends a filled circle (triangle fan, GL_TRIANGLES-friendly) centered at
+// a SCREEN pixel position, radius also in pixels — used for the on-screen
+// move-stick HUD. Independently normalizing x by width and y by height maps
+// an equal pixel radius to a visually round circle regardless of aspect
+// ratio, with z=0 and an identity uMvp so it draws as a flat 2D overlay
+// through the same shader/VBO as the 3D world markers.
+void AppendCircleScreen(
+    float centerX, float centerY, float radiusPx, int width, int height, int segments,
+    std::vector<float>& out
+) {
+    if (width <= 0 || height <= 0 || segments < 3) {
+        return;
+    }
+    const auto toNdc = [&](float px, float py, float outXyz[3]) {
+        outXyz[0] = (px / static_cast<float>(width)) * 2.0f - 1.0f;
+        outXyz[1] = 1.0f - (py / static_cast<float>(height)) * 2.0f;
+        outXyz[2] = 0.0f;
+    };
+    float center[3];
+    toNdc(centerX, centerY, center);
+    float prev[3];
+    toNdc(centerX + radiusPx, centerY, prev);
+    for (int i = 1; i <= segments; ++i) {
+        const float angle = 6.28318530718f * static_cast<float>(i) / static_cast<float>(segments);
+        float next[3];
+        toNdc(centerX + radiusPx * std::cos(angle), centerY + radiusPx * std::sin(angle), next);
+        out.insert(out.end(), {center[0], center[1], center[2]});
+        out.insert(out.end(), {prev[0], prev[1], prev[2]});
+        out.insert(out.end(), {next[0], next[1], next[2]});
+        prev[0] = next[0];
+        prev[1] = next[1];
+        prev[2] = next[2];
+    }
+}
+
 // Background map-zone loader: the launch command kicks a worker thread that
 // decompresses the map fastfile, runs the zone loader, and publishes the
 // extracted world scene for the render thread to upload.
@@ -2043,6 +2078,58 @@ void DrawWorldScene(GlContext& gl) {
         glDisable(GL_BLEND);
     };
 
+    // On-screen move-stick HUD: a translucent base ring at the finger's
+    // touch-down point plus a knob offset by the live drag, visible only
+    // while worldTouchMode==1 (left-half move zone, see UpdateWorldCamera).
+    // Purely visual feedback for movement that already works today —
+    // doesn't change input handling, screen-space overlay drawn identity-
+    // transformed through the same marker shader/VBO as decals/flash.
+    const auto drawWorldMoveStick = [&]() {
+        if (gl.worldMarkerProgram == 0 || gl.worldTouchMode != 1) {
+            return;
+        }
+        const TouchSnapshot stickTouch = GetTouchSnapshot();
+        constexpr float kInputRadius = 140.0f; // matches UpdateWorldCamera's stick divisor
+        constexpr float kMaxTravelPx = 50.0f;  // visual knob travel, independent of input feel
+        constexpr float kBaseRadiusPx = 70.0f;
+        constexpr float kKnobRadiusPx = 32.0f;
+        const float normX = std::clamp((stickTouch.x - gl.worldTouchStartX) / kInputRadius, -1.0f, 1.0f);
+        const float normY = std::clamp((stickTouch.y - gl.worldTouchStartY) / kInputRadius, -1.0f, 1.0f);
+
+        glUseProgram(gl.worldMarkerProgram);
+        constexpr float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        glUniformMatrix4fv(gl.worldMarkerMvpUniform, 1, GL_FALSE, kIdentity);
+        glBindBuffer(GL_ARRAY_BUFFER, gl.worldMarkerVbo);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        std::vector<float> baseVerts;
+        AppendCircleScreen(
+            gl.worldTouchStartX, gl.worldTouchStartY, kBaseRadiusPx, gl.width, gl.height, 28, baseVerts);
+        glBufferData(
+            GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(baseVerts.size() * sizeof(float)),
+            baseVerts.data(), GL_DYNAMIC_DRAW
+        );
+        glUniform4f(gl.worldMarkerColorUniform, 1.0f, 1.0f, 1.0f, 0.22f);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(baseVerts.size() / 3));
+
+        std::vector<float> knobVerts;
+        AppendCircleScreen(
+            gl.worldTouchStartX + normX * kMaxTravelPx, gl.worldTouchStartY + normY * kMaxTravelPx,
+            kKnobRadiusPx, gl.width, gl.height, 24, knobVerts
+        );
+        glBufferData(
+            GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(knobVerts.size() * sizeof(float)),
+            knobVerts.data(), GL_DYNAMIC_DRAW
+        );
+        glUniform4f(gl.worldMarkerColorUniform, 1.0f, 1.0f, 1.0f, 0.5f);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(knobVerts.size() / 3));
+
+        glDisable(GL_BLEND);
+    };
+
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
     glEnableVertexAttribArray(2);
@@ -2063,6 +2150,9 @@ void DrawWorldScene(GlContext& gl) {
     glDisableVertexAttribArray(0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glDisable(GL_DEPTH_TEST);
+    glEnableVertexAttribArray(0);
+    drawWorldMoveStick();
+    glDisableVertexAttribArray(0);
     glActiveTexture(GL_TEXTURE0);
 
     // Frame pacing telemetry: a hidden-app freeze looks identical to a slow
