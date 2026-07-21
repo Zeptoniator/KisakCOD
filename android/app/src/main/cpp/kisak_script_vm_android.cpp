@@ -1257,6 +1257,58 @@ void Interpreter::Run() {
                 cursor.pos = target.functionEntryOffset;
                 break;
             }
+            // Entity/object-model blueprint step 2: object-prefixed calls
+            // (`<expr> funcName(...)` / `<expr> thread funcName(...)`).
+            // Byte-identical to OP_ScriptFunctionCall/OP_ScriptThreadCall
+            // except the new frame's self is the popped RECEIVER value
+            // (pushed by the compiler immediately before the call, step 4)
+            // instead of the caller's inherited self. Retail requires the
+            // receiver to be VAR_POINTER for both opcodes (scr_vm.cpp:
+            // 2815-2820/2891-2896, "%s is not an object") -- confirmed by
+            // direct research, matching this port's Object type check
+            // exactly; not a guess. Deliberately NOT implementing
+            // OP_ScriptMethodCallPointer/OP_ScriptMethodThreadCallPointer
+            // (the local-FunctionRef-pointer tier) -- same cut as the
+            // non-method call forms; they fall through to the default
+            // "unsupported opcode" branch below, which already logs a
+            // specific, non-silent error naming the exact opcode.
+            case KisakScriptOpcode::OP_ScriptMethodCall: {
+                if (stack.empty()) { RuntimeError("OP_ScriptMethodCall stack underflow"); return; }
+                KisakScriptValue receiver = pop();
+                if (receiver.type != KisakScriptValueType::Object) {
+                    RuntimeError(receiver.Describe() + " is not an object");
+                    return;
+                }
+                uint32_t entry = cursor.ReadCodePos();
+                if (frames.size() >= 32) { RuntimeError("script stack overflow"); return; }
+                Frame callee;
+                callee.returnPos = cursor.pos;
+                callee.self = std::move(receiver);
+                frames.push_back(std::move(callee));
+                cursor.pos = entry;
+                break;
+            }
+            // Same synchronous-inline simplification as OP_ScriptThreadCall
+            // (see its own comment above) -- the callee runs to completion
+            // right here; the compiler (step 4) discards its return value
+            // with a trailing OP_DecTop, exactly as it already does for the
+            // non-method threaded form.
+            case KisakScriptOpcode::OP_ScriptMethodThreadCall: {
+                if (stack.empty()) { RuntimeError("OP_ScriptMethodThreadCall stack underflow"); return; }
+                KisakScriptValue receiver = pop();
+                if (receiver.type != KisakScriptValueType::Object) {
+                    RuntimeError(receiver.Describe() + " is not an object");
+                    return;
+                }
+                uint32_t entry = cursor.ReadCodePos();
+                if (frames.size() >= 32) { RuntimeError("script stack overflow"); return; }
+                Frame callee;
+                callee.returnPos = cursor.pos;
+                callee.self = std::move(receiver);
+                frames.push_back(std::move(callee));
+                cursor.pos = entry;
+                break;
+            }
             case KisakScriptOpcode::OP_Return: {
                 KisakScriptValue ret = pop();
                 while (top().type != KisakScriptValueType::CodePos) {
