@@ -306,6 +306,26 @@ struct Compiler {
                 EmitU16(InternString(n.text));
                 return true;
             case Kind::IdentifierExpr: return EmitIdentifierRead(n);
+            // Arrays blueprint (plans/android-gscript-arrays.md) step 3, READ
+            // context (an ArrayIndexExpr used as an assignment TARGET never
+            // reaches here — EmitAssignment special-cases it before dispatching
+            // to EmitExpression).
+            case Kind::ArrayLiteralExpr: EmitOp(Op::OP_EmptyArray); return true;
+            case Kind::ArrayIndexExpr:
+                if (n.children.size() != 2 || !n.children[0] || !n.children[1]) {
+                    Error(n.line, "malformed array subscript"); return true;
+                }
+                EmitExpression(*n.children[0]);   // base -> array on stack
+                EmitExpression(*n.children[1]);   // key on top
+                EmitOp(Op::OP_EvalArray);
+                return true;
+            case Kind::ArraySizeExpr:
+                if (n.children.empty() || !n.children[0]) {
+                    Error(n.line, "malformed .size expression"); return true;
+                }
+                EmitExpression(*n.children[0]);
+                EmitOp(Op::OP_size);
+                return true;
             case Kind::BinaryExpr: return EmitBinary(n);
             case Kind::UnaryExpr: return EmitUnary(n);
             case Kind::CallExpr: return EmitCall(n);
@@ -635,6 +655,40 @@ struct Compiler {
         if (target.kind == Kind::FieldAccessExpr) {
             Error(n.line, "field assignment '." + target.text + "' needs an entity/object model: " +
                           std::string(kEntityDeferred));
+            return;
+        }
+        // Arrays blueprint (plans/android-gscript-arrays.md) step 3: an
+        // ArrayIndexExpr target (`arr[key] = value`) writes into an array
+        // element. Emitted as: base, key, OP_EvalArrayRef (establishes the
+        // element ref), value, OP_SetVariableField (writes through it).
+        if (target.kind == Kind::ArrayIndexExpr) {
+            if (target.children.size() != 2 || !target.children[0] || !target.children[1]) {
+                Error(n.line, "malformed array subscript assignment"); return;
+            }
+            if (!n.text.empty()) {
+                // Compound assignment on an array element (`arr[key] += v`) is a
+                // deliberate, documented scope cut. No real corpus GSC uses it
+                // (grep of the device-extracted .gsc for `[...] OP=` found none),
+                // and doing it correctly requires establishing the element ref
+                // ONCE and read-modify-writing through it, to avoid double-
+                // evaluating the key expression's side effects (e.g. the `i++`
+                // in `arr[i++] += v`). This port has no array-element ref-READ
+                // opcode wired, and there is no established idiom here to reuse
+                // safely, so reject explicitly rather than silently miscompile.
+                Error(n.line, "compound assignment '" + n.text + "' on an array element is "
+                              "not supported (arrays blueprint step 3 scope cut — no real "
+                              "corpus uses it); use a plain '=' assignment instead");
+                return;
+            }
+            // Emit the base through the SAME EmitExpression path every other
+            // expression takes — so a FieldAccessExpr base (`level.x[0] = v`)
+            // still correctly hits EmitExpression's entity-deferred rejection
+            // rather than slipping past it via a shortcut.
+            EmitExpression(*target.children[0]);   // base -> array on stack
+            EmitExpression(*target.children[1]);   // key on top
+            EmitOp(Op::OP_EvalArrayRef);
+            EmitExpression(value);
+            EmitOp(Op::OP_SetVariableField);
             return;
         }
         if (target.kind != Kind::IdentifierExpr) {

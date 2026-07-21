@@ -525,10 +525,34 @@ namespace {
 // own local-variable slots. Locals are addressed newest-first to match retail's
 // scrVmPub.localVars scheme, where OP_EvalLocalVariableCached0 reads the most
 // recently created local (localVars[0]) and cached index N reads localVars[-N].
+//
+// Arrays blueprint (plans/android-gscript-arrays.md) step 3 EXTENDED the lvalue
+// reference from a bare local-slot index to a small tagged variant, because the
+// same OP_SetVariableField setter now serves two target shapes:
+//   LocalSlot    -> refSlot (absolute index into `locals`). Established by
+//                   OP_EvalLocalVariableRefCached0/Cached; written by
+//                   OP_SetVariableField and read-modified-written by
+//                   OP_inc/OP_dec. This is the ONLY shape that existed before
+//                   this step, and its behaviour is unchanged.
+//   ArrayElement -> (refArray, refArrayKey): a specific key in a shared array
+//                   map. Established by OP_EvalArrayRef; written by
+//                   OP_SetVariableField. refArray is a shared_ptr COPY of the
+//                   subscripted array's element map, so writing through it
+//                   mutates the same map every alias of that array sees (retail
+//                   ref-counted VAR_POINTER array semantics — the load-bearing
+//                   property arrays exist to provide). OP_inc/OP_dec never
+//                   target this shape in this port (the compiler only emits
+//                   ++/-- against a plain local), so their bare-refSlot path
+//                   below stays correct.
+enum class RefKind : uint8_t { None, LocalSlot, ArrayElement };
 struct Frame {
     size_t returnPos = 0;                    // caller cursor position to resume at
     std::vector<KisakScriptValue> locals;
-    int refSlot = -1;                        // absolute index of the current lvalue ref
+    RefKind refKind = RefKind::None;
+    int refSlot = -1;                        // valid when refKind == LocalSlot
+    // valid when refKind == ArrayElement:
+    std::shared_ptr<std::map<KisakArrayKey, KisakScriptValue>> refArray;
+    KisakArrayKey refArrayKey;
 };
 
 // The whole executor lives here so the opcode handlers can share stack/frame/
@@ -864,19 +888,73 @@ void Interpreter::Run() {
                 break;
             }
             case KisakScriptOpcode::OP_EvalLocalVariableRefCached0:
+                frame().refKind = RefKind::LocalSlot;
                 frame().refSlot = SlotIndex(0);
                 if (!SlotValid(frame().refSlot)) { RuntimeError("ref local0 out of range"); return; }
                 break;
             case KisakScriptOpcode::OP_EvalLocalVariableRefCached: {
                 uint32_t cached = cursor.ReadByte();
+                frame().refKind = RefKind::LocalSlot;
                 frame().refSlot = SlotIndex(cached);
                 if (!SlotValid(frame().refSlot)) { RuntimeError("ref local out of range"); return; }
                 break;
             }
-            case KisakScriptOpcode::OP_SetVariableField: {
-                if (!SlotValid(frame().refSlot)) { RuntimeError("OP_SetVariableField without a ref"); return; }
-                frame().locals[frame().refSlot] = pop();
+            // Arrays blueprint (plans/android-gscript-arrays.md) step 3:
+            // establish a WRITE reference to `array[key]`, consumed by the
+            // OP_SetVariableField that the compiler always emits next. Retail
+            // pairs the real OP_EvalArrayRef with the same generic setter
+            // (OP_SetVariableField); this port mirrors that shape, extending the
+            // frame's lvalue-ref state rather than inventing a combined opcode.
+            //
+            // Stack contract (matches OP_EvalArray's read order, since this port
+            // controls both emission and dispatch):
+            //   before:  ... , arrayValue , keyValue     (key on top)
+            //   after:   ...                              (both popped; ref on frame)
+            // arrayValue must be Array-typed and keyValue Int/String, else a
+            // RuntimeError (never a crash or silent no-op — retail Scr_Error's on
+            // a non-array target too). refArray is a shared_ptr copy of the same
+            // element map the array aliases share, so the following write is
+            // visible through every alias of that array.
+            case KisakScriptOpcode::OP_EvalArrayRef: {
+                KisakScriptValue key = pop();
+                if (stack.empty()) { RuntimeError("OP_EvalArrayRef stack underflow"); return; }
+                KisakScriptValue arr = pop();
+                if (arr.type != KisakScriptValueType::Array) {
+                    RuntimeError("cannot assign into a subscript of " + arr.Describe());
+                    return;
+                }
+                if (!arr.arrayElements) {
+                    RuntimeError("OP_EvalArrayRef: array has no backing storage");
+                    return;
+                }
+                KisakArrayKey k;
+                if (key.type == KisakScriptValueType::Int) {
+                    k = KisakArrayKey::FromInt(key.i);
+                } else if (key.type == KisakScriptValueType::String) {
+                    k = KisakArrayKey::FromString(key.s);
+                } else {
+                    RuntimeError(key.Describe() + " is not an array index");
+                    return;
+                }
+                frame().refKind = RefKind::ArrayElement;
+                frame().refArray = arr.arrayElements;
+                frame().refArrayKey = std::move(k);
                 break;
+            }
+            case KisakScriptOpcode::OP_SetVariableField: {
+                Frame& fr = frame();
+                if (fr.refKind == RefKind::ArrayElement) {
+                    if (!fr.refArray) { RuntimeError("OP_SetVariableField: array ref is null"); return; }
+                    if (stack.empty()) { RuntimeError("OP_SetVariableField stack underflow"); return; }
+                    (*fr.refArray)[fr.refArrayKey] = pop();
+                    break;
+                }
+                if (fr.refKind == RefKind::LocalSlot && SlotValid(fr.refSlot)) {
+                    fr.locals[fr.refSlot] = pop();
+                    break;
+                }
+                RuntimeError("OP_SetVariableField without a ref");
+                return;
             }
 
             // ---- parameter binding / call prologue ----
