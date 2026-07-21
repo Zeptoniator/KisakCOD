@@ -287,6 +287,22 @@ enum class KisakScriptValueType : uint8_t {
     // OP_EmptyArray; read via OP_EvalArray; OP_EvalArrayRef (array-element
     // assignment) is step 3's join-point responsibility, not this step's.
     Array,
+    // Entity/object-model blueprint (plans/android-gscript-entity-model.md),
+    // step 1: a generic field-storage object -- the value type behind
+    // self/level/game (retail: all three are VAR_POINTER into the SAME kind
+    // of shared, string-keyed variable-pool object, see scr_vm.cpp:2273-2297
+    // and Scr_FindVariableField/scr_vm.cpp:2432-2458). Deliberately shaped
+    // like Array above (shared_ptr to a map, giving retail's reference
+    // semantics for free) rather than a fresh container design -- keys are
+    // plain field names (std::string) instead of KisakArrayKey. `anim` is
+    // explicitly out of scope (unused by the real corpus at every current
+    // failure boundary across four blueprints' worth of validation this
+    // session) so this port only ever allocates self/level/game objects.
+    // Produced by OP_GetSelf/OP_GetLevel/OP_GetGame; read via the existing
+    // (previously unimplemented) OP_EvalFieldVariable; written via the
+    // existing OP_EvalFieldVariableRef + OP_SetVariableField, mirroring how
+    // OP_EvalArrayRef extended the same generic setter for Array above.
+    Object,
 };
 
 // Array key: GScript array subscripts are either an integer or a string
@@ -342,6 +358,13 @@ struct KisakScriptValue {
     // deep-copying on every assignment/argument-pass, which would silently
     // diverge from real GSC array-aliasing behavior.
     std::shared_ptr<std::map<KisakArrayKey, KisakScriptValue>> arrayElements;
+    // Dedicated payload for Object: same shared_ptr-for-reference-semantics
+    // rationale as arrayElements above (copying a KisakScriptValue::Object
+    // copies the shared_ptr, so `level` read via two separate OP_GetLevel
+    // instructions in the same Execute() call still aliases the SAME
+    // underlying field map), but keyed by field name (std::string) instead
+    // of KisakArrayKey.
+    std::shared_ptr<std::map<std::string, KisakScriptValue>> objectFields;
 
     static KisakScriptValue Undefined();
     static KisakScriptValue Int(int32_t v);
@@ -350,6 +373,7 @@ struct KisakScriptValue {
     static KisakScriptValue Marker(KisakScriptValueType marker);
     static KisakScriptValue FunctionRef(uint32_t entryOffset);
     static KisakScriptValue Array();
+    static KisakScriptValue Object();
 
     bool IsNumeric() const { return type == KisakScriptValueType::Int ||
                                     type == KisakScriptValueType::Float; }

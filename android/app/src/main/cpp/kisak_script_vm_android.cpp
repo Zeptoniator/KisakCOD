@@ -272,6 +272,13 @@ KisakScriptValue KisakScriptValue::Array() {
     return out;
 }
 
+KisakScriptValue KisakScriptValue::Object() {
+    KisakScriptValue out;
+    out.type = KisakScriptValueType::Object;
+    out.objectFields = std::make_shared<std::map<std::string, KisakScriptValue>>();
+    return out;
+}
+
 bool KisakScriptValue::Truthy() const {
     switch (type) {
         case KisakScriptValueType::Int: return i != 0;
@@ -284,6 +291,9 @@ bool KisakScriptValue::Truthy() const {
         // constructed — same reasoning as FunctionRef above; retail's
         // VAR_POINTER arrays have no "null array" state either.
         case KisakScriptValueType::Array: return true;
+        // Same reasoning as Array above: self/level/game are always valid,
+        // non-null objects once constructed in this port.
+        case KisakScriptValueType::Object: return true;
         default: return false;
     }
 }
@@ -307,6 +317,10 @@ std::string KisakScriptValue::Describe() const {
         case KisakScriptValueType::Array:
             std::snprintf(buf, sizeof(buf), "array[%zu]",
                           arrayElements ? arrayElements->size() : size_t{0});
+            return buf;
+        case KisakScriptValueType::Object:
+            std::snprintf(buf, sizeof(buf), "object[%zu fields]",
+                          objectFields ? objectFields->size() : size_t{0});
             return buf;
     }
     return "<?>";
@@ -332,6 +346,9 @@ std::string KisakScriptValue::AsString() const {
         // FunctionRef/CodePos/PreCodePos above, not a guess at retail's exact
         // formatting.
         case KisakScriptValueType::Array:
+        // Same reasoning as Array above: no real-corpus usage prints an
+        // object (self/level/game) directly as a string.
+        case KisakScriptValueType::Object:
             return "";
     }
     return "";
@@ -544,7 +561,12 @@ namespace {
 //                   target this shape in this port (the compiler only emits
 //                   ++/-- against a plain local), so their bare-refSlot path
 //                   below stays correct.
-enum class RefKind : uint8_t { None, LocalSlot, ArrayElement };
+// Entity/object-model blueprint (plans/android-gscript-entity-model.md) step
+// 1: extends the tagged ref variant with a THIRD shape, ObjectField, parallel
+// to ArrayElement above -- established by OP_EvalFieldVariableRef; written
+// by the SAME OP_SetVariableField dispatch (extend its switch, don't add a
+// new setter opcode -- matches the arrays blueprint's own precedent).
+enum class RefKind : uint8_t { None, LocalSlot, ArrayElement, ObjectField };
 struct Frame {
     size_t returnPos = 0;                    // caller cursor position to resume at
     std::vector<KisakScriptValue> locals;
@@ -553,6 +575,20 @@ struct Frame {
     // valid when refKind == ArrayElement:
     std::shared_ptr<std::map<KisakArrayKey, KisakScriptValue>> refArray;
     KisakArrayKey refArrayKey;
+    // valid when refKind == ObjectField: a shared_ptr COPY of the target
+    // object's field map (same aliasing rationale as refArray above) plus
+    // the field name to write.
+    std::shared_ptr<std::map<std::string, KisakScriptValue>> refObject;
+    std::string refFieldName;
+    // Entity/object-model blueprint step 1, Architecture fact 2: this frame's
+    // bound `self` (a KisakScriptValue::Object, or Undefined at the outermost
+    // frame -- this port has no top-level "world entity" to bind it to, an
+    // honest simplification, not a retail-faithful default). Ordinary calls
+    // (OP_ScriptFunctionCall/OP_ScriptThreadCall/OP_ScriptFunctionCallPointer)
+    // copy the CALLER's current self into the new frame (real-retail-faithful
+    // inheritance); OP_ScriptMethodCall/OP_ScriptMethodThreadCall (step 2)
+    // instead pop an explicit receiver and use that.
+    KisakScriptValue self;
 };
 
 // The whole executor lives here so the opcode handlers can share stack/frame/
@@ -566,6 +602,19 @@ struct Interpreter {
     bool halted = false;
     KisakScriptLogFn logFn = nullptr;
     uint64_t maxSteps = 0;
+
+    // Entity/object-model blueprint step 1, Architecture fact 3: singleton
+    // Object values owned by the Interpreter, allocated once per Execute()
+    // call and handed out by value on every OP_GetLevel/OP_GetGame (the
+    // KisakScriptValue wrapper is copied, but objectFields' shared_ptr is
+    // shared -- same aliasing property as arrays, now on objects). `anim` is
+    // out of scope (Scope Cut item 1) so only these two exist. Known,
+    // documented simplification (Scope Cut item 6): these do NOT persist
+    // across separate Execute() calls the way retail's level/game persist
+    // across an entire game session -- unobservable today since exactly one
+    // Execute() call happens per script trigger.
+    KisakScriptValue levelObject = KisakScriptValue::Object();
+    KisakScriptValue gameObject = KisakScriptValue::Object();
 
     explicit Interpreter(const KisakScriptProgram& prog) : program(prog) {
         cursor.bytecode = &prog.bytecode;
@@ -794,6 +843,24 @@ void Interpreter::Run() {
                 push(KisakScriptValue::FunctionRef(cursor.ReadCodePos()));
                 break;
 
+            // Entity/object-model blueprint step 1: self/level/game as
+            // generic field-storage objects (Architecture facts 1-3;
+            // scr_vm.cpp:2273-2297's OP_GetSelf/OP_GetLevel/OP_GetGame all
+            // just push a pointer to one of these shared objects). `self` is
+            // per-frame (Frame::self, inherited through ordinary calls, see
+            // OP_ScriptFunctionCall/OP_ScriptThreadCall/
+            // OP_ScriptFunctionCallPointer below); `level`/`game` are
+            // Interpreter-owned singletons allocated once per Execute() call.
+            case KisakScriptOpcode::OP_GetSelf:
+                push(frame().self);
+                break;
+            case KisakScriptOpcode::OP_GetLevel:
+                push(levelObject);
+                break;
+            case KisakScriptOpcode::OP_GetGame:
+                push(gameObject);
+                break;
+
             // Arrays blueprint (plans/android-gscript-arrays.md) step 1:
             // `[]` -- always an EMPTY array (retail: Scr_AllocArray(),
             // scr_vm.cpp:2420-2424; there is no "array literal with initial
@@ -839,6 +906,44 @@ void Interpreter::Run() {
                 }
                 auto it = arr.arrayElements->find(k);
                 push(it != arr.arrayElements->end() ? it->second : KisakScriptValue::Undefined());
+                break;
+            }
+
+            // Entity/object-model blueprint step 1: generic field read
+            // (Architecture fact 4). Reuses the EXISTING declared-but-
+            // unimplemented OP_EvalFieldVariable (0x2A) enum entry -- this
+            // port's own collapsed generic replacement for retail's several
+            // fast-path field-read opcodes (OP_EvalLevelFieldVariable etc,
+            // scr_vm.cpp:2432-2458's Scr_FindVariableField/FindVariable
+            // family), matching how OP_EvalArray collapsed retail's array
+            // fast-paths into one opcode. Field name is a COMPILE-TIME
+            // CONSTANT, encoded as a 2-byte stringPool index exactly like
+            // OP_GetString's operand (NOT like OP_EvalArrayRef's key, which
+            // is a runtime-computed value popped off the stack -- a field
+            // name never is). Reading a never-written field pushes
+            // Undefined, not a RuntimeError, matching this port's own
+            // established missing-key-returns-Undefined precedent from
+            // OP_EvalArray and real retail's own behavior for an unset field.
+            case KisakScriptOpcode::OP_EvalFieldVariable: {
+                uint16_t id = cursor.ReadUnsignedShort();
+                if (id >= program.stringPool.size()) {
+                    RuntimeError("OP_EvalFieldVariable: field name id " + std::to_string(id) +
+                                 " out of range (pool size " +
+                                 std::to_string(program.stringPool.size()) + ")");
+                    return;
+                }
+                if (stack.empty()) { RuntimeError("OP_EvalFieldVariable stack underflow"); return; }
+                KisakScriptValue obj = pop();
+                if (obj.type != KisakScriptValueType::Object) {
+                    RuntimeError(obj.Describe() + " is not an object");
+                    return;
+                }
+                if (!obj.objectFields) {
+                    push(KisakScriptValue::Undefined());
+                    break;
+                }
+                auto it = obj.objectFields->find(program.stringPool[id]);
+                push(it != obj.objectFields->end() ? it->second : KisakScriptValue::Undefined());
                 break;
             }
 
@@ -941,12 +1046,58 @@ void Interpreter::Run() {
                 frame().refArrayKey = std::move(k);
                 break;
             }
+            // Entity/object-model blueprint step 1: establish a WRITE
+            // reference to `object.fieldName` (Architecture fact 5), mirroring
+            // OP_EvalArrayRef's shape exactly. Reuses the EXISTING declared-
+            // but-unimplemented OP_EvalFieldVariableRef (0x2E) enum entry --
+            // do not invent a new opcode. Field name operand encoding matches
+            // OP_EvalFieldVariable above (2-byte stringPool index, a compile-
+            // time constant). Consumed by the SAME OP_SetVariableField
+            // dispatch below (extended with a new RefKind::ObjectField case)
+            // -- no new setter opcode, matching the arrays review's own
+            // precedent for OP_EvalArrayRef/OP_SetVariableField.
+            case KisakScriptOpcode::OP_EvalFieldVariableRef: {
+                uint16_t id = cursor.ReadUnsignedShort();
+                if (id >= program.stringPool.size()) {
+                    RuntimeError("OP_EvalFieldVariableRef: field name id " + std::to_string(id) +
+                                 " out of range (pool size " +
+                                 std::to_string(program.stringPool.size()) + ")");
+                    return;
+                }
+                if (stack.empty()) { RuntimeError("OP_EvalFieldVariableRef stack underflow"); return; }
+                KisakScriptValue obj = pop();
+                if (obj.type != KisakScriptValueType::Object) {
+                    RuntimeError("cannot assign a field of " + obj.Describe());
+                    return;
+                }
+                if (!obj.objectFields) {
+                    RuntimeError("OP_EvalFieldVariableRef: object has no backing storage");
+                    return;
+                }
+                frame().refKind = RefKind::ObjectField;
+                frame().refObject = obj.objectFields;
+                frame().refFieldName = program.stringPool[id];
+                break;
+            }
             case KisakScriptOpcode::OP_SetVariableField: {
                 Frame& fr = frame();
                 if (fr.refKind == RefKind::ArrayElement) {
                     if (!fr.refArray) { RuntimeError("OP_SetVariableField: array ref is null"); return; }
                     if (stack.empty()) { RuntimeError("OP_SetVariableField stack underflow"); return; }
                     (*fr.refArray)[fr.refArrayKey] = pop();
+                    break;
+                }
+                // Entity/object-model blueprint step 1: writing an object
+                // field. std::map::operator[] default-constructs the entry
+                // if the field has never been written, so a first-time write
+                // to a previously-unset field just works (no special-casing
+                // needed) -- distinct from the field-holding-an-ARRAY
+                // auto-vivification case (level.foo[key] = x with no prior
+                // level.foo = [];), which is Step 4's own separate task.
+                if (fr.refKind == RefKind::ObjectField) {
+                    if (!fr.refObject) { RuntimeError("OP_SetVariableField: object ref is null"); return; }
+                    if (stack.empty()) { RuntimeError("OP_SetVariableField stack underflow"); return; }
+                    (*fr.refObject)[fr.refFieldName] = pop();
                     break;
                 }
                 if (fr.refKind == RefKind::LocalSlot && SlotValid(fr.refSlot)) {
@@ -1001,6 +1152,13 @@ void Interpreter::Run() {
                 if (frames.size() >= 32) { RuntimeError("script stack overflow"); return; }
                 Frame callee;
                 callee.returnPos = cursor.pos;
+                // Entity/object-model blueprint step 1, Architecture fact 2:
+                // an ordinary (non-rebinding) call inherits the CALLER's
+                // current self -- real-retail-faithful, needed for
+                // self.field to mean anything sensible inside any nested
+                // call. Read frame().self BEFORE pushing the new frame (it
+                // still refers to the caller here).
+                callee.self = frame().self;
                 frames.push_back(std::move(callee));
                 cursor.pos = entry;
                 break;
@@ -1030,6 +1188,11 @@ void Interpreter::Run() {
                 if (frames.size() >= 32) { RuntimeError("script stack overflow"); return; }
                 Frame callee;
                 callee.returnPos = cursor.pos;
+                // Entity/object-model blueprint step 1: a threaded (but,
+                // per this port's synchronous-inline simplification, still
+                // an ordinary non-rebinding) call also inherits the caller's
+                // self -- same reasoning as OP_ScriptFunctionCall above.
+                callee.self = frame().self;
                 frames.push_back(std::move(callee));
                 cursor.pos = entry;
                 break;
@@ -1084,6 +1247,12 @@ void Interpreter::Run() {
                 if (frames.size() >= 32) { RuntimeError("script stack overflow"); return; }
                 Frame callee;
                 callee.returnPos = cursor.pos;
+                // Entity/object-model blueprint step 1 (fix applied after
+                // adversarial review, M1): this pointer-call path also
+                // pushes a frame and must inherit self too, or self would
+                // silently drop to Undefined through any [[fp]]() call --
+                // same reasoning as OP_ScriptFunctionCall above.
+                callee.self = frame().self;
                 frames.push_back(std::move(callee));
                 cursor.pos = target.functionEntryOffset;
                 break;
