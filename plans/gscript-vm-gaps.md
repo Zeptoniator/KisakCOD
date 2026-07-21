@@ -40,9 +40,18 @@ arrays blueprint entry below; `ClearArray`/the cached-local-read variants
 remain unimplemented, deliberately, per that blueprint's own scope cut),
 bare threading (`ScriptThreadCall/wait` — see the threading blueprint
 entry below; `waittillFrameEnd/waittill/waittillmatch/notify/endon/
-ScriptMethodThreadCall/ScriptThreadCallPointer/ScriptMethodThreadCallPointer`
-remain unimplemented, deliberately, per that blueprint's own scope cut).
-**76 of 138 real opcodes implemented** (counted directly against
+ScriptThreadCallPointer` remain unimplemented, deliberately, per that
+blueprint's own scope cut), self/level/game object model (`GetSelf/
+GetLevel/GetGame/EvalFieldVariable/EvalFieldVariableRef/ScriptMethodCall/
+ScriptMethodThreadCall` — see the entity/object-model blueprint entry
+below; `GetAnim/EvalLevelFieldVariable/EvalAnimFieldVariable/
+EvalSelfFieldVariable/EvalLevelFieldVariableRef/EvalAnimFieldVariableRef/
+EvalSelfFieldVariableRef/CallBuiltinMethod*/ScriptMethodCallPointer/
+ScriptMethodThreadCallPointer` remain unimplemented, deliberately, per
+that blueprint's own scope cut — the fast-path field variants are
+retail-only optimizations this port collapsed into the two generic
+opcodes above, not a coverage gap).
+**83 of 138 real opcodes implemented** (counted directly against
 `KisakScriptOpcode`'s 139 entries minus the `OP_count` sentinel).
 
 **Builtins** (`KisakScriptBuiltinTable()`, 12 entries): `print`, `println`,
@@ -53,15 +62,19 @@ was an always-false stub before the arrays blueprint), `getdvar`,
 
 **Grammar** (`kisak_script_parser_android.cpp`): function definitions with
 params, blocks, `if`/`else`/`else if`, `while`, `for`, `return`, assignment
-(simple + `+=`/`-=`/`*=`/`/=`/`%=`), postfix/prefix unary (`++`/`--`/`!`/`-`/
+(simple + `+=`/`-=`/`*=`/`/=`/`%=`, including on a field target — see
+entity-model row below), postfix/prefix unary (`++`/`--`/`!`/`-`/
 `~`), all arithmetic/comparison/logical binary operators, bare function calls,
-field access (`.field`, read-only in the parser — write is compiler-rejected),
-GSC's no-dot method-call syntax (`<object-expr> <bareword>(args)`),
+field access (`.field`, read AND write — see entity-model row below),
+GSC's no-dot method-call syntax (`<object-expr> <bareword>(args)`, both
+non-threaded — already covered pre-entity-model — and threaded, `<expr>
+thread funcName(args);`/`<expr> thread path\file::func(args);`, a new
+`MethodThreadCallStatement` node — see entity-model row below),
 `#include path\segment;` (parsed and dropped, no AST content), arrays
 (`[]` literal — always empty, no populated-literal syntax exists in real
 GSC; `expr[key]` subscript, chainable, both read and assignment-target
 contexts; `expr.size`, its own AST node kind, deliberately separate from
-the deferred `.field` entity-model boundary), bare threading (`thread
+the entity-model field-access mechanism), bare threading (`thread
 funcName(args);` / `thread path\file::func(args);` — no object prefix;
 `wait <expr>;`, including a fix to promote `wait` from a plain Identifier
 to a real keyword, a genuine gap from the original lexer step).
@@ -70,22 +83,51 @@ to a real keyword, a genuine gap from the original lexer step).
 `script_model`, `trigger_multiple` — 2 of the real spawn table's ~25 entries
 (`s_bspOrDynamicSpawns`/`s_bspOnlySpawns`, `g_spawn.cpp:45,71`).
 
+**Self/level/game object model** (`plans/android-gscript-entity-model.md`,
+2026-07-21, all 6 steps): a new `Object` value type (shared_ptr-backed
+string-keyed field map, same reference-semantics shape as `Array`);
+`self`/`level`/`game` as real, generic field-storage objects — field read
+AND write both work (plain and compound, `+=`/`-=`/etc — confirmed against
+real corpus, `self.baseaccuracy *= .8;`), including a field that itself
+holds an array (`level.foo[key] = x`), with real AUTO-VIVIFICATION when the
+field was never previously initialized (`level.fogvalue["near"] = 100;`
+with no prior `level.fogvalue = [];` — cargoship's own real first `main()`
+statement); object-prefixed calls, both non-threaded (`self setModel(...)`)
+and threaded (`level thread maps\file::main();`, the exact construct that
+was the shared blocker for killhouse/cargoship going into this blueprint),
+rebinding the callee's `self` to the receiver; `self` inheritance through
+ordinary (non-rebinding) calls, including through the local-function-
+pointer-call path. Explicit, deliberate scope cuts (all still rejected,
+with specific errors, not silently accepted): `anim` (unused by the real
+corpus at every failure boundary across all five blueprints this session);
+entity builtin-method calls (`entity.hide()`-style — no game/entity-
+simulation backing exists); `waittill`/`notify`/`endon`/`waittillmatch`/
+`waittillframeend` (real thread-suspension semantics this port's
+synchronous VM has no scheduler for — confirmed these are lexer keywords
+that structurally cannot be misparsed as a call under any of this port's
+grammar, so the rejection is a legible message, not a safety-critical
+check); the local-`FunctionRef`-pointer tier for object-prefixed calls (no
+`OP_ScriptMethodCall(Thread)Pointer` opcode exists); assignment to a bare
+object keyword (`level = x;`); cross-`Execute()`-call persistence of
+`level`/`game` (freshly allocated per `Execute()` call — unobservable
+today, since exactly one `Execute()` call happens per script trigger).
+
 ## Not covered (deliberate, documented boundaries — not bugs)
 
 | Area | Gap | Why deferred | Where it would land |
 |---|---|---|---|
-| VM | Entity/object model: no `OP_GetSelf/GetLevel/GetGame/GetAnim`, no `OP_Eval*FieldVariable`/`OP_Set*FieldVariableField`, no `OP_CallBuiltinMethod*` | Genuinely new subsystem (a real `gentity_s`-equivalent + field storage), not an opcode-sized gap | New blueprint: "entity field access" |
+| ~~VM~~ | ~~Entity/object model: no `OP_GetSelf/GetLevel/GetGame`, no `OP_Eval*FieldVariable`, no `OP_ScriptMethodCall(Thread)`~~ | **COVERED (self/level/game field access + object-prefixed calls)** as of `plans/android-gscript-entity-model.md` (2026-07-21, all 6 steps) — see the "Covered" paragraph above. `GetAnim`/`OP_CallBuiltinMethod*` remain deliberately unimplemented (`anim` unused by the real corpus; no entity/game-simulation backing exists for builtin-method dispatch). | — |
 | ~~Parser+VM~~ | ~~Bare `thread`/`wait`~~ | **COVERED (bare/self-implicit forms only)** as of `plans/android-gscript-threading.md` (2026-07-21, all 5 steps) — `thread funcName(args);`/`thread path\file::func(args);` (same-file and cross-file, both confirmed on real corpus) implemented as a documented, synchronous-inline simplification (no true concurrency — this port's VM has no per-frame re-entry point to suspend into); `wait <expr>;` validates its argument (matching retail's Int/Float/negative-rejection checks exactly) but is a documented no-op, no real delay modeled. `wait` was ALSO promoted from a plain Identifier to a real lexer keyword as part of this (a genuine pre-existing gap, not a deliberate omission — the lexer's own header comment already cited a real `wait .1;` example from this corpus). | — |
-| Parser+VM | **Object-prefixed** `<expr> thread funcName(...)` (needs a real `self`-binding mechanism) and `waittill`/`waittillmatch`/`waittillframeend`/`notify`/`endon` (every one requires a genuine `VAR_POINTER`-typed object argument) — explicitly deferred by the threading blueprint's own scope cut (~36 and ~52 real corpus sites respectively, vs. 133+80 covered). **Confirmed, post-threading, to be the CURRENT real blocker for 2 of 3 real levels**: killhouse (unchanged, line 221) and cargoship (advanced to line 172) both now hit the identical `level thread <target>::main();` construct as their next failure point. | Needs the entity/object model's `self` mechanism (a real addressable object value) before either can be meaningfully implemented — not an opcode-sized gap | Same blueprint as the VM entity model, see below |
+| ~~Parser+VM~~ | ~~Object-prefixed `<expr> thread funcName(...)`~~ | **COVERED** as of `plans/android-gscript-entity-model.md` — the exact shared blocker killhouse/cargoship converged on (`level thread maps\<file>::main();`) now compiles AND executes end to end, confirmed against both real levels via the full cross-file pipeline. `waittill`/`waittillmatch`/`waittillframeend`/`notify`/`endon` remain explicitly deferred (real thread-suspension semantics this port's synchronous VM has no scheduler for) — confirmed these are lexer keywords, structurally impossible to misparse as a call under any of this port's grammar, so a legible "deferred subsystem" message is all that's needed, not a safety mechanism. | — |
 | Parser | `/# ... #/` — real COD4 GSC's debug-block delimiter (brackets debug-only code, e.g. AI pain-debugging hooks). **Newly discovered** (threading blueprint step 4, bog_a.gsc line 106) — never identified by any of the four prior blueprints' own research phases. This port's lexer currently tokenizes `/` and `#` as separate operators, not the paired delimiter retail's real grammar treats them as. | Not anticipated by any prior research pass — a genuine gap, not a deliberate scope cut | Likely a small, independent, mechanical fix (skip the bracketed block, similar to how `#include` is parsed-and-dropped today) — plausibly NOT entangled with the entity model at all, a possible easy win before that blueprint lands |
-| VM | `switch`/`case`/`default`/`break` (as a switch, not a loop-break — loops have no `break`/`continue` either) | Not attempted; `Opcode_t` has `OP_switch`/`OP_endswitch` unimplemented | New, small, standalone blueprint — genuinely independent of arrays/namespaced-calls/threading, none of which touched it; not yet the measured first-hit gap for any real level, so still low urgency |
-| ~~VM~~ | ~~Arrays~~ | **COVERED (plain-variable arrays only)** as of `plans/android-gscript-arrays.md` (2026-07-21, all 5 steps) — `Array` value type (shared_ptr-backed map, reference semantics matching retail's ref-counted `VAR_POINTER` arrays), `[]`/`[key]`/`.size` fully working for read AND write, both int- and string-keyed against the same array. Explicit, deliberate scope cut: `level.field[key]`/`self.field[key]` are NOT covered — still rejected by the pre-existing entity-model compile-time check (`kEntityDeferred`), same as plain `.field` assignment; that requires the entity/object-model blueprint, not this one. Compound assignment on an array element (`arr[key] += v`) is also explicitly rejected (no real corpus usage found) rather than risking a double-key-evaluation miscompile. | — |
+| VM | `switch`/`case`/`default`/`break` (as a switch, not a loop-break — loops have no `break`/`continue` either) | Not attempted; `Opcode_t` has `OP_switch`/`OP_endswitch` unimplemented | **Re-ranked upward** as of the entity-model blueprint's step 5 (2026-07-21): now the actual, measured first-hit gap for a real level for the first time across six blueprints' worth of real-corpus re-validation — cargoship advances all the way to line 189's `switch(level.jumptosection) { case "bridge": ... }` once entity-model field access + object-prefixed calls landed. Still a small, standalone blueprint, genuinely independent of everything shipped so far. |
+| ~~VM~~ | ~~Arrays~~ | **COVERED (plain-variable arrays AND arrays-on-entity-fields)** as of `plans/android-gscript-arrays.md` (2026-07-21, all 5 steps, plain variables) + `plans/android-gscript-entity-model.md` (2026-07-21, step 4, arrays on self/level/game fields, INCLUDING auto-vivification on first indexed write to an unset field). `Array` value type (shared_ptr-backed map, reference semantics matching retail's ref-counted `VAR_POINTER` arrays), `[]`/`[key]`/`.size` fully working for read AND write, both int- and string-keyed against the same array, on plain locals AND on object fields alike. Compound assignment on an array element (`arr[key] += v`) is still explicitly rejected (no real corpus usage found) rather than risking a double-key-evaluation miscompile — compound assignment on a plain FIELD (no array), by contrast, IS covered (no key-expression to double-evaluate). | — |
 | VM | `OP_GetIString` (interned/localized strings) | No localization table; `&"KEY"` degrades to a plain `OP_GetString` (step 8) | Needs the real string/localize table, likely same effort as arrays |
 | VM | Vectors (`OP_GetVector`, `OP_vector`) | No vector literal grammar (step 7 never disambiguated `(x,y,z)` from a parenthesized expr) | Parser + VM value-type work, moderate |
 | ~~Parser~~ | ~~Namespaced calls (`path\file::func()`) and function pointers (`::func`)~~ | **COVERED** as of `plans/android-gscript-namespaced-calls.md` (2026-07-21, all 6 steps) — bare `::func`/same-file namespaced calls resolve via `FunctionRef`+`OP_GetFunction`/`OP_ScriptFunctionCallPointer`; cross-file namespaced calls resolve via `CompileGscZoneEntryPoint`'s qualified symbol table + cross-file backpatch, for any target file present in the SAME scanned zone. Still cannot resolve a call into a file absent from every zone this port ever scans (e.g. `maps\_blackhawk::main()`, a shared cross-mission script) — that is a data-availability limit, not a parser/compiler gap; see the plan's own Objective section. | — |
 | Parser | `#using_animtree(...)` and any other `#`-directive besides `#include` | Not anticipated when step 7 wrote `SkipIncludeDirective` — first real discovery this step (hunted.gsc line 5) | Small, mechanical parser fix |
 | ~~Parser~~ | ~~Array subscript syntax~~ | **COVERED**, see the VM row above. | — |
-| Compiler | Field access/assignment and method calls on `self`/`level`/`game`/`anim` | Rejected with a specific compile error (step 8) — depends on the VM entity-model gap above | Same blueprint as VM entity model |
+| ~~Compiler~~ | ~~Field access/assignment and method calls on `self`/`level`/`game`/`anim`~~ | **COVERED (self/level/game)** as of `plans/android-gscript-entity-model.md` — see the "Covered" paragraph above. `anim` remains rejected with a specific compile error (unused by the real corpus at every current failure boundary). | — |
 | Entities | Only `script_model`/`trigger_multiple` — no `trigger_once`, `trigger_hurt`, `trigger_use`, `light`, `misc_turret`, actors (`actor_*`), items, vehicles, etc. | Step 5 explicitly scoped to "one basic trigger class" + script_model | New blueprint: "full entity spawn" |
 | Entities | `spawn(classname, x, y, z)` is NOT retail's signature (`spawn(classname, origin)`, a vector) and returns an opaque Int handle, not a usable entity reference | No vector literal grammar, no entity value type (both above) | Resolved once vectors + entity model land |
 | — | Full AI (`src/game/actor_*.cpp`, ~26,700 lines) | Always out of scope for this entire plan, not just this step | A separate ~20k+-line blueprint, per the plan's own plan-level notes |
@@ -192,6 +234,27 @@ wait for the entity-model blueprint at all.
 Full account, including the exact real source lines, in
 `plans/gscript-real-source-notes.md`'s threading-step-4 addendum.
 
+### Re-run after `android-gscript-entity-model.md` (step 5, 2026-07-21)
+
+Same 4 levels (killhouse re-added to this specific harness, which had only
+covered cargoship/bog_a/hunted since the namespaced-calls era), after
+self/level/game field access + object-prefixed calls moved from "not
+covered" to "covered" above. **The plan's own prediction — a LARGE jump for
+killhouse/cargoship specifically — confirmed precisely, not assumed**:
+
+| Level | Method | New result | Delta |
+|---|---|---|---|
+| killhouse | host (full fastfile/rawfile/`CompileGscZoneEntryPoint` pipeline) + **real device** (same finding, see below) | Parse fails line 371: `level waittill ( "mission failed" );` | Line 221 → 371 (**+150 lines**) — past the shared cross-file blocker AND every field-access construct in between; lands on the FIRST genuinely out-of-scope construct (`waittill`, Scope Cut item 3 — anticipated, not a surprise) |
+| cargoship | host | Parse fails line 189: `switch(level.jumptosection) { ... }` | Line 172 → 189 (**+17 lines**) — past the shared cross-file blocker AND `level.fogvalue["near"] = 100;`'s own real auto-vivification (line 10, confirmed no longer a blocker); lands on a genuinely NEW gap, `switch`/`case` (re-ranked above) |
+| bog_a | host | **UNCHANGED**, line 106: `/#` | No change — the `/#` debug-block gap sits earlier in the file than anything this blueprint touches; confirmed unrelated, not a missed opportunity (this blueprint's own isolated test already proves bog_a.gsc:807's real `self set_force_color("c");` compiles and executes correctly) |
+| hunted | host | Unchanged, line 5, `#`-directive | No change — correct, unrelated |
+
+**Both entity-model-targeted files now land on constructs this blueprint
+explicitly predicted or scoped out, not on anything mysterious.** Full
+account, including exact real source lines and the auto-vivification
+cross-check, in `plans/gscript-real-source-notes.md`'s entity-model-step-5
+addendum.
+
 ## Device regression pass
 
 ### Original pass (step 10 of the VM port, 2026-07-20/21)
@@ -296,48 +359,74 @@ with visible forward movement. None of this blueprint's commits touch
 touch/render/audio code, so this is additional confirming evidence of no
 regression, not something this blueprint can take credit for causing.
 
+### Re-run after `android-gscript-entity-model.md` (step 6, 2026-07-21)
+
+Confirmed on-device (killhouse, fresh app install + launch): world
+rendering unchanged from the established baseline (vehicle body paint/camo
+textures, viewmodel weapon, buildings/props/street all correct, screenshot-
+identical). Crash buffer empty (`crashcheck` clean) throughout, including
+after triggering `New Game` → `devmap killhouse`. Script pipeline:
+`Step9 script 'maps/killhouse.gsc': COMPILATION ECHOUEE (1 erreurs, 0
+fichiers chaines): maps/killhouse.gsc parse: line 371: 'waittill' is a
+deferred subsystem, not yet supported by this grammar subset (plans/
+android-gscript-entity-model.md, Scope Cut item 3)` — exactly matching
+Step 5's host-confirmed finding, message and line both identical, no
+discrepancy between the host pipeline and the real device zone-loader
+path. World/mission zone loaded fully afterward (1684/1684 assets).
+
+**Inconclusive this pass, same documented artifact as several prior
+passes**: synthetic `adb shell input swipe` gestures for the HUD move-
+stick and camera look did not produce a visible change across 2 attempts
+each. This blueprint's commits never touched touch/render/input code (only
+the GScript VM/compiler files), so this is judged the same synthetic-input
+timing flakiness already documented multiple times in this file, not a
+regression — flagged honestly rather than re-claimed as freshly verified.
+
 ## Recommendation for whoever picks up the next blueprint
 
-Re-ranked 2026-07-21 after the threading blueprint (bare `thread`/`wait`)
-shipped and was re-validated against real, whole-file data (see above).
-Two real levels (killhouse, cargoship) now converge on the identical next
-construct — this is the clearest, most measured signal any blueprint in
-this series has produced so far.
+Re-ranked 2026-07-21 after the entity/object-model blueprint (self/level/
+game field access + object-prefixed calls) shipped and was re-validated
+against real, whole-file data on both host and device (see above). This is
+the SIXTH GScript blueprint this session (namespaced-calls, arrays,
+threading, entity-model, in that order) — the remaining gap list is now
+short, and for the first time every item on it is either low-urgency or
+newly-discovered rather than a known convergent blocker.
 
-1. **Entity/object model** (`self`/`level`/`game`, field access, `spawn`
-   returning something real) — **the clear top priority**, confirmed by
-   two convergent real levels: killhouse (line 221) and cargoship (line
-   172) now BOTH fail on the identical object-prefixed `thread <target>::
-   main();` construct, which needs a real `self`-binding mechanism this
-   port doesn't have. This is also the biggest single subsystem and the
-   one every other real script eventually needs — `level.field`/
-   `self.field` accesses are already correctly rejected today by the
-   existing `kEntityDeferred` compile-time check, this blueprint doesn't
-   need to do anything new to make that correct, it just needs to REPLACE
-   the rejection with real behavior.
-2. **Object-prefixed `thread`** (`<expr> thread funcName(...)`) and
-   **`waittill`/`notify`/`endon`** — bundle this with the entity/object-
-   model blueprint above rather than a separate threading follow-up, since
-   all of them need the SAME `self`-binding mechanism the entity model
-   would build anyway; the bare-thread blueprint already proved out the
-   opcode-reuse pattern (`OP_ScriptThreadCall`, `OP_ScriptMethodThreadCall`'s
-   real-retail equivalent) these would extend.
-3. **`/# ... #/` debug-block delimiter** — **newly discovered** (threading
-   blueprint step 4, bog_a.gsc:106), architecturally UNRELATED to the
-   entity model (a lex/parse-level gap, likely a small mechanical fix). A
-   plausible quick, independent win for a future session that wants
-   something smaller than the entity-model blueprint — does not need to
-   wait for it.
-4. Arrays' own remaining gap: `level.field[key]`/`self.field[key]` (arrays
-   ON entity fields) — resolved automatically once the entity/object model
-   lands, since plain-variable arrays are already fully working; no
-   separate work needed here.
-5. `switch`/`case`/`default`/loop `break`/`continue` — still low measured
-   urgency (never the first-hit gap for any of the 4 real scripts across
-   three re-validation passes now).
-6. ~~Namespaced calls + function pointers~~ — **shipped**, see "Covered" above.
-7. ~~Arrays (plain-variable)~~ — **shipped**, see "Covered" above.
-8. ~~Bare threading (`thread`/`wait`)~~ — **shipped**, see "Covered" above.
+1. **`switch`/`case`/`default`/loop `break`/`continue`** — **the new top
+   priority**, promoted from "low measured urgency" to the FIRST real,
+   measured first-hit gap any real level has ever reached across six
+   blueprints' worth of re-validation: cargoship now advances all the way
+   to line 189's `switch(level.jumptosection) { case "bridge": ...}` once
+   entity-model field access unblocked everything before it. A small,
+   standalone blueprint — genuinely independent of every subsystem shipped
+   so far (arrays/namespaced-calls/threading/entity-model never touched
+   `OP_switch`/`OP_endswitch`, both still unimplemented).
+2. **`waittill`/`notify`/`endon`/`waittillmatch`/`waittillframeend`** —
+   killhouse's own current blocker (line 371, `level waittill(...)`), the
+   FIRST real level to ever reach this construct as its measured next
+   gap. Needs real thread-suspension semantics this port's synchronous VM
+   has no scheduler for (the same architectural gap the threading
+   blueprint already identified for bare `thread`/`wait`) — a genuinely
+   new subsystem, not an opcode-sized patch. The entity/object model these
+   depend on (a real `self`/addressable-object argument) now EXISTS
+   (this blueprint), so this is more tractable than it was before, but
+   still needs its own scoping pass for the suspend/resume question.
+3. **`/# ... #/` debug-block delimiter** — still open (threading
+   blueprint step 4, bog_a.gsc:106), architecturally UNRELATED to
+   anything shipped since. Still bog_a's own actual current blocker (this
+   blueprint made zero visible difference to bog_a's real-file progress,
+   confirmed and explained above) — a plausible quick, independent win
+   for a future session, still doesn't need to wait for anything else.
+4. `OP_GetIString` (localized strings), vectors (`OP_GetVector`/`OP_vector`),
+   `#using_animtree(...)`/other `#`-directives, fuller entity spawn
+   coverage — all still open, all still lower-measured-urgency than the
+   three above (none has ever been the first-hit gap for any real level).
+5. ~~Namespaced calls + function pointers~~ — **shipped**, see "Covered" above.
+6. ~~Arrays (plain-variable AND on entity fields, incl. auto-vivification)~~
+   — **shipped**, see "Covered" above.
+7. ~~Bare threading (`thread`/`wait`)~~ — **shipped**, see "Covered" above.
+8. ~~Entity/object model (self/level/game field access + object-prefixed
+   calls)~~ — **shipped**, see "Covered" above.
 
 Full AI (`actor_*.cpp`) remains explicitly out of scope for all of the above
 — a separate blueprint again, per the original plan's own note.
