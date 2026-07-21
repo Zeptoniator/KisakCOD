@@ -65,7 +65,7 @@ GSC's no-dot method-call syntax (`<object-expr> <bareword>(args)`),
 | VM | Arrays (`OP_EvalArray/EvalLocalArrayCached/ClearArray/EmptyArray` etc.) | No array value type in `KisakScriptValue`; real scripts use array subscripts constantly (`level.fogvalue["near"]`, confirmed in cargoship.gsc line 10) | New blueprint: "GScript arrays" — **highest real-world priority**, see findings below |
 | VM | `OP_GetIString` (interned/localized strings) | No localization table; `&"KEY"` degrades to a plain `OP_GetString` (step 8) | Needs the real string/localize table, likely same effort as arrays |
 | VM | Vectors (`OP_GetVector`, `OP_vector`) | No vector literal grammar (step 7 never disambiguated `(x,y,z)` from a parenthesized expr) | Parser + VM value-type work, moderate |
-| Parser | Namespaced calls (`path\file::func()`) and function pointers (`::func`) | Explicitly deferred by step 7; **the single most common real-world blocker** — see findings below | Parser extension + a cross-file symbol model |
+| ~~Parser~~ | ~~Namespaced calls (`path\file::func()`) and function pointers (`::func`)~~ | **COVERED** as of `plans/android-gscript-namespaced-calls.md` (2026-07-21, all 6 steps) — bare `::func`/same-file namespaced calls resolve via `FunctionRef`+`OP_GetFunction`/`OP_ScriptFunctionCallPointer`; cross-file namespaced calls resolve via `CompileGscZoneEntryPoint`'s qualified symbol table + cross-file backpatch, for any target file present in the SAME scanned zone. Still cannot resolve a call into a file absent from every zone this port ever scans (e.g. `maps\_blackhawk::main()`, a shared cross-mission script) — that is a data-availability limit, not a parser/compiler gap; see the plan's own Objective section. | — |
 | Parser | `#using_animtree(...)` and any other `#`-directive besides `#include` | Not anticipated when step 7 wrote `SkipIncludeDirective` — first real discovery this step (hunted.gsc line 5) | Small, mechanical parser fix |
 | Parser | Array subscript syntax `expr["key"]` / `expr[index]` | Same root cause as VM arrays — no array value type to target | Same blueprint as VM arrays |
 | Compiler | Field access/assignment and method calls on `self`/`level`/`game`/`anim` | Rejected with a specific compile error (step 8) — depends on the VM entity-model gap above | Same blueprint as VM entity model |
@@ -73,7 +73,9 @@ GSC's no-dot method-call syntax (`<object-expr> <bareword>(args)`),
 | Entities | `spawn(classname, x, y, z)` is NOT retail's signature (`spawn(classname, origin)`, a vector) and returns an opaque Int handle, not a usable entity reference | No vector literal grammar, no entity value type (both above) | Resolved once vectors + entity model land |
 | — | Full AI (`src/game/actor_*.cpp`, ~26,700 lines) | Always out of scope for this entire plan, not just this step | A separate ~20k+-line blueprint, per the plan's own plan-level notes |
 
-## Real multi-level validation (this step's own device + host pass)
+## Real multi-level validation
+
+### Original pass (step 10 of the VM port, 2026-07-20)
 
 Ran the full pipeline against **4 real levels** (exceeds the "2-3" task):
 
@@ -89,15 +91,35 @@ end**, each at a different but equally real, correctly-diagnosed construct —
 zero crashes, zero silent misdispatch. Three of four (killhouse, bog_a, and
 by strong inference most other SP missions, since `default_start`/
 `add_start( ..., ::funcname, ... )` is the standard mission-init idiom) hit
-the **namespaced-call/function-pointer gap first or very early** — this is
-the single highest-leverage next step if a future blueprint wants a real
-mission's `main()` to run further than line ~10-40. Arrays (cargoship) and
-stray `#`-directives (hunted) are the next two most common blockers.
+the **namespaced-call/function-pointer gap first or very early**.
+
+### Re-run after `android-gscript-namespaced-calls.md` (step 6, 2026-07-21)
+
+Same 4 levels, same method per level, after namespaced calls/function
+pointers moved from "not covered" to "covered" above:
+
+| Level | Method | New result | Delta |
+|---|---|---|---|
+| killhouse | **real device**, `StartWorldLoad` + `CompileAndRunScriptFromZone` | Compile fails line 204: `level.weaponClipModels = [];` — array literal | Line 27 → 204 (177 lines further); the plan's own hoped-for line 209 (`maps\_blackhawk::main()`, a missing-file error) sits just beyond an EARLIER, different, out-of-scope gap (arrays) that this specific script also happens to hit first — not reached this pass |
+| bog_a | host, same `CompileGscZoneEntryPoint` path | Compile fails line 71: `level.weaponClipModels = [];` — array literal | Line 43 → 71 (28 lines further); **the plan's target construct at line 43 (`maps\bog_a_fx::main()`) now resolves cleanly**, along with `maps\_javelin::init()` (line 44) and the 2-segment `maps\createfx\bog_a_audio::main()` (line 69) — all 3 confirmed present in bog_a.ff's own rawfiles before compiling, not assumed |
+| cargoship | host, unchanged path (single-file, no namespaced call before its own failure point) | Still line 10, same message | No change — correct, this script's blocker was never the namespaced-call gap |
+| hunted | host, unchanged path | Still line 5, same message | No change — correct, same reasoning |
+
+**bog_a is the clean, direct proof this plan worked**: 3 real namespaced
+calls that used to be unparseable now compile and link correctly, in a
+script this port never modified except via the namespaced-calls plan
+itself. killhouse shows real, if partial, progress (177 lines) but is
+gated on the SAME array-literal construct one step earlier than hoped —
+confirming arrays (not the originally-assumed `_blackhawk` cross-zone
+resolution) are now the genuine next blocker for both of these two real
+scripts. cargoship/hunted correctly unchanged, as predicted going in.
 
 No VM/compiler bug was found in any of these — every rejection matches a
 documented, intentional scope boundary above.
 
-## Device regression pass (this step)
+## Device regression pass
+
+### Original pass (step 10 of the VM port, 2026-07-20/21)
 
 Confirmed working on-device (killhouse, fresh app relaunch, 2026-07-20/21):
 world rendering (255 static models / 12225 instances / 8694 surfaces,
@@ -128,24 +150,54 @@ finger on the touchscreen would be the natural way to close this out if
 certainty is ever needed; it is not blocking anything in this plan, since
 the code path is unchanged.
 
+### Re-run after `android-gscript-namespaced-calls.md` (step 6, 2026-07-21)
+
+Confirmed working on-device (killhouse, same session as the multi-level
+re-validation above): world rendering unchanged (screenshot-identical to
+baseline, same buildings/props/vehicles), camera look + move-stick
+movement both responsive, **HUD move-stick overlay confirmed visible**
+this time round-trip (the first two capture attempts missed it purely on
+adb round-trip timing between starting the held swipe and firing the
+screenshot in a SEPARATE adb call — a single inlined `adb shell "input
+swipe ... & sleep 1; screencap ..."` call caught it cleanly; not a
+regression, a capture-timing artifact of using two separate adb
+invocations). Hitscan fire mechanism itself fires cleanly and logs `Tir:
+aucun impact (hors de portee)` on 2/2 synthetic-tap attempts (no crash,
+confirms the fire-detection branch this plan never touched still runs) —
+**no impact was registered on either attempt** despite aiming at a nearby
+wall; consistent with this project's own prior finding that the fire path
+is specifically flaky under synthetic input (unlike look/move, which
+registered reliably both this session and every prior one) — flagged
+honestly as inconclusive on IMPACT REGISTRATION specifically, not on
+whether the mechanism runs (it does). Audio not independently
+re-exercised this pass (gated on a registered impact, which didn't occur)
+— code path unchanged since the original VM plan, same reasoning as above
+applies.
+
 ## Recommendation for whoever picks up the next blueprint
 
-In priority order, by real-world impact (per the 4-level validation above):
+Re-ranked 2026-07-21 after namespaced calls/function pointers shipped and
+were re-validated against real data (see above) — arrays are now confirmed,
+not just predicted, to be the next real blocker:
 
-1. **Namespaced calls + function pointers** (`path\file::func`, `::func`) —
-   unblocks the most real scripts, the furthest, for the least new-subsystem
-   risk (it's "more parser + a cross-file name table," not a new VM concept).
-2. **Arrays** (value type + `OP_EvalArray`/subscript grammar) — the second
-   most common real blocker, and also required before entity field access
-   is very useful (real scripts store per-frame state in arrays constantly).
-3. **Entity/object model** (`self`/`level`/`game`, field access, `spawn`
+1. **Arrays** (value type + `OP_EvalArray`/subscript grammar, plus array
+   *literal* construction — `level.weaponClipModels = [];` then indexed
+   assignment — confirmed the actual next blocker on BOTH killhouse line
+   204 and bog_a line 71, not just cargoship's original line 10 finding).
+   Also required before entity field access is very useful (real scripts
+   store per-frame state in arrays constantly).
+2. **Entity/object model** (`self`/`level`/`game`, field access, `spawn`
    returning something real) — the biggest single subsystem, but also the
-   one every other real script eventually needs; sequence it after 1+2 so
-   it isn't fighting parser/array gaps at the same time.
-4. Threading/`waittill`/`notify`/`switch` — lower real-world urgency than
-   the above three based on this session's findings (none of the 4 real
+   one every other real script eventually needs; sequence it after arrays
+   so it isn't fighting the array gap at the same time (killhouse/bog_a's
+   OWN next lines after the array literal are more array indexing, not
+   field access).
+3. Threading/`waittill`/`notify`/`switch` — lower real-world urgency than
+   the above two based on this session's findings (none of the 4 real
    scripts hit these FIRST), but eventually necessary for anything beyond a
    few lines of any real mission script.
+4. ~~Namespaced calls + function pointers~~ — **shipped**, see "Covered"
+   above.
 
 Full AI (`actor_*.cpp`) remains explicitly out of scope for all of the above
 — a separate blueprint again, per the original plan's own note.
