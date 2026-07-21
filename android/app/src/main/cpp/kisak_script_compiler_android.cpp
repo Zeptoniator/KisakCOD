@@ -161,6 +161,13 @@ struct Compiler {
     // Compiler processes one function body at a time either way.
     std::vector<LoopOrSwitchContext> loopSwitchStack;
 
+    // Switch/loop-control blueprint step 3: SwitchStatement node -> its
+    // hidden local slot's generated name (see CollectLocals's own comment).
+    // Populated once per function during the locals pre-scan, read by
+    // EmitSwitch — a single source of truth, not two independently-
+    // recomputed counters.
+    std::unordered_map<const KisakAstNode*, std::string> switchSlotNames;
+
     // Cross-file session state; all null in a single-file compile. When set,
     // this file's functions are ALSO registered under their qualified key, and
     // a NON-empty-path reference emits a cross-file call + a CrossFileFixup
@@ -326,6 +333,22 @@ struct Compiler {
     // plain IdentifierExpr (not an entity keyword, not already a param/known
     // local) declares a new local. Field-access targets are left alone here —
     // they're rejected at emit time with the entity-model message.
+    //
+    // Switch/loop-control blueprint step 3: also reserves one HIDDEN local
+    // slot per SwitchStatement node encountered, so the switch's subject
+    // expression can be evaluated exactly once and re-read by every
+    // comparison in the dispatch prologue (Architecture fact 3). Keyed by
+    // the node's own address in `switchSlotNames` (populated HERE, read
+    // later by EmitSwitch) rather than a separately-recomputed counter in
+    // each of the two traversals — corrected by adversarial review (M4):
+    // two independent traversals re-deriving "the same" counter is a
+    // fragile coupling; a single map populated once and read once sidesteps
+    // it entirely. The generated name (`$switch0`, `$switch1`, ...) uses a
+    // leading `$`, a character this port's lexer's IsIdentStart/IsIdentCont
+    // cannot produce as part of a real identifier (confirmed against
+    // kisak_script_lexer_android.cpp) -- a leading `__` would NOT be
+    // collision-proof, since `_` is an ordinary identifier-start character
+    // here and a real script could name a variable `__switch_tmp`.
     void CollectLocals(const KisakAstNode& node, FunctionLocals& out,
                        std::vector<std::string>& order) {
         if (node.kind == Kind::Assignment && !node.children.empty() &&
@@ -334,6 +357,14 @@ struct Compiler {
             if (!IsEntityKeyword(name) && !out.Has(name)) {
                 out.creationOrder[name] = static_cast<int>(order.size()) + out.total;
                 order.push_back(name);
+            }
+        }
+        if (node.kind == Kind::SwitchStatement) {
+            std::string hiddenName = "$switch" + std::to_string(switchSlotNames.size());
+            switchSlotNames[&node] = hiddenName;
+            if (!out.Has(hiddenName)) {
+                out.creationOrder[hiddenName] = static_cast<int>(order.size()) + out.total;
+                order.push_back(hiddenName);
             }
         }
         for (const auto& child : node.children) {
@@ -858,6 +889,7 @@ struct Compiler {
             // comment above for the full design.
             case Kind::BreakStatement: EmitBreak(n); break;
             case Kind::ContinueStatement: EmitContinue(n); break;
+            case Kind::SwitchStatement: EmitSwitch(n); break;
             // `wait <expr>;` -- emit the duration, then OP_wait (validates
             // type/range, documented no-op otherwise — step 1).
             case Kind::WaitStatement: {
@@ -1173,6 +1205,105 @@ struct Compiler {
         for (size_t at : finished.breakFixups) PatchForward32(at);
     }
 
+    // Switch/loop-control blueprint step 3, JOIN: switch statement
+    // desugaring via a SPLIT-DISPATCH layout (Architecture fact 3,
+    // CRITICALLY corrected by adversarial review before any code was
+    // written — an earlier draft interleaved each case's comparison
+    // directly before its own body, which silently produces the OPPOSITE
+    // of fallthrough; see the plan's own Plan-level notes for the full
+    // trace). The layout:
+    //   1. Evaluate the subject ONCE, store into the hidden slot (so
+    //      `ally_sas_woodland_smg_mp5.gsc`'s call-expression subject,
+    //      `codescripts\character::get_random_character(5)`, is never
+    //      re-evaluated).
+    //   2. Push a switch context (no continue-fixup mechanism) so break;
+    //      inside any case body works via Step 2's shared mechanism, and
+    //      continue; correctly searches PAST this context for an
+    //      enclosing loop.
+    //   3. DISPATCH PROLOGUE: one (EvalLocal, literal, OP_equality,
+    //      OP_JumpOnTrue) comparison per non-default clause, in source
+    //      order, each jumping to a forward-patched body label. After the
+    //      last comparison, ONE unconditional OP_jump reaches either the
+    //      default clause's body (wherever it sits in source order -- no
+    //      special-casing needed for a non-last default) or the switch's
+    //      own end if there is no default.
+    //   4. BODY BLOCK: every clause's statements, contiguous, in source
+    //      order, with NO jump inserted between clauses -- this omission
+    //      IS the fallthrough (cargoship_extract.gsc:189's own headline
+    //      construct: matching the first case runs every subsequent
+    //      case's body too, since nothing jumps out early absent a
+    //      `break;`).
+    // OP_JumpOnTrue's operands are `uint16` (`PatchForward16`, max 0xFFFF,
+    // matching every other forward-conditional-jump in this compiler) --
+    // PatchForward16 already errors cleanly rather than corrupting
+    // bytecode if a switch's own body block ever exceeds that bound, so
+    // this is a recognized, understood limit, not a silent risk.
+    void EmitSwitch(const KisakAstNode& n) {
+        if (n.children.empty() || !n.children[0]) {
+            Error(n.line, "malformed switch statement"); return;
+        }
+        auto slotIt = switchSlotNames.find(&n);
+        if (slotIt == switchSlotNames.end()) {
+            Error(n.line, "internal: switch statement has no pre-allocated hidden slot");
+            return;
+        }
+        int cached = locals.Cached(slotIt->second);
+
+        // Evaluate the subject once, store into the hidden slot.
+        EmitExpression(*n.children[0]);
+        EmitSetLocal(cached);
+
+        LoopOrSwitchContext ctx;
+        ctx.kind = LoopOrSwitchKind::Switch;
+        loopSwitchStack.push_back(std::move(ctx));
+
+        // Dispatch prologue: one comparison per non-default clause.
+        std::vector<size_t> jumpTrueFixups(n.children.size(), 0);
+        bool hasDefault = false;
+        for (size_t i = 1; i < n.children.size(); ++i) {
+            const KisakAstNode& clause = *n.children[i];
+            if (clause.isDefault) {
+                if (hasDefault) {
+                    Error(n.line, "switch has more than one 'default:' clause");
+                }
+                hasDefault = true;
+                continue;
+            }
+            if (clause.children.empty() || !clause.children[0]) {
+                Error(n.line, "malformed case clause"); continue;
+            }
+            EmitEvalLocal(cached);
+            EmitExpression(*clause.children[0]);  // the case's literal value
+            EmitOp(Op::OP_equality);
+            jumpTrueFixups[i] = EmitJumpOnTruePlaceholder();
+        }
+        // The single "no case matched" jump -- reaches default's body if
+        // one exists (patched below, at whatever source position it sits
+        // at), else falls through to Lend (patched after the body loop).
+        size_t noMatchJumpAt = EmitJumpPlaceholder();
+
+        // Body block: every clause's statements, contiguous, source order.
+        for (size_t i = 1; i < n.children.size(); ++i) {
+            const KisakAstNode& clause = *n.children[i];
+            if (clause.isDefault) {
+                PatchForward32(noMatchJumpAt);
+            } else {
+                PatchForward16(jumpTrueFixups[i], n.line);
+            }
+            size_t bodyStart = clause.isDefault ? 0 : 1;  // skip the value node for non-default clauses
+            for (size_t k = bodyStart; k < clause.children.size(); ++k) {
+                if (clause.children[k]) EmitStatement(*clause.children[k]);
+            }
+        }
+        if (!hasDefault) {
+            PatchForward32(noMatchJumpAt);  // no default -> falls straight to Lend
+        }
+
+        LoopOrSwitchContext finished = std::move(loopSwitchStack.back());
+        loopSwitchStack.pop_back();
+        for (size_t at : finished.breakFixups) PatchForward32(at);
+    }
+
     void EmitReturn(const KisakAstNode& n) {
         if (!n.children.empty() && n.children[0]) EmitExpression(*n.children[0]);
         else EmitOp(Op::OP_GetUndefined);  // OP_Return always pops a value
@@ -1195,6 +1326,7 @@ struct Compiler {
         // locals. Params are created newest-last so parameter i lands at
         // creation order (nparams-1-i) — see the prologue emission below.
         locals = FunctionLocals{};
+        switchSlotNames.clear();  // per-function, like `locals` itself
         int nparams = static_cast<int>(fn.stringList.size());
         for (int i = 0; i < nparams; ++i) {
             // creation order of param i = nparams-1-i (params SafeCreate'd in
