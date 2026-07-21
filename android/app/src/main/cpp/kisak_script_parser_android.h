@@ -63,6 +63,18 @@ enum class KisakAstNodeKind : uint8_t {
     ForStatement,          // children[0] = init (optional), children[1] = condition (optional), children[2] = increment (optional), children[3] = body
     ReturnStatement,       // children[0] = expr (optional)
     ExpressionStatement,   // children[0] = expr
+    // Threading blueprint (plans/android-gscript-threading.md) step 2. Bare
+    // `thread funcName(args);` / `thread path\file::func(args);` — no
+    // object prefix (object-prefixed `<expr> thread ...` is explicitly out
+    // of scope, see the plan's own Scope Cut section; it never reaches this
+    // node kind, since it fails earlier as an ordinary expression-statement
+    // parse attempt). children[0] = the call being threaded, itself an
+    // ordinary CallExpr/NamespacedCallExpr produced by the ordinary call
+    // grammar — `thread` is purely a statement-level prefix, not a new call
+    // form.
+    ThreadCallStatement,
+    // `wait <expr>;` — children[0] = the duration expression.
+    WaitStatement,
     Assignment,            // children[0] = target (Identifier or FieldAccess), children[1] = value; text = compound-assign operator ("", "+=", "-=", "*=", "/=", "%=")
     BinaryExpr,            // text = operator; children[0] = left, children[1] = right
     UnaryExpr,             // text = operator; children[0] = operand

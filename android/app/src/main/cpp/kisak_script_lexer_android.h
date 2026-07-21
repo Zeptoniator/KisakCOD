@@ -67,10 +67,18 @@ enum class KisakScriptTokenType : uint8_t {
 // the lexer at least classifies them correctly if step 9+ hits a script
 // that uses them (deferred to the parser either way, per step 6's own
 // "no AST yet" scope).
+//
+// `Wait` (threading blueprint, plans/android-gscript-threading.md, step 2):
+// a genuine gap from the original step 6 lexer work, not a deliberate
+// omission — the header comment above already cites a real `wait .1;`
+// example from this exact corpus, yet no `Wait` entry ever existed here,
+// so it lexed as a plain Identifier until now. Fixed as part of adding
+// real grammar for `wait <expr>;` (extremely common in the real corpus,
+// 80 occurrences in killhouse.gsc alone).
 enum class KisakScriptKeyword : uint8_t {
     None = 0,
     If, Else, While, For, Switch, Case, Default, Break, Continue, Return,
-    Thread, Waittill, Waittillmatch, Waittillframeend, Notify, Endon,
+    Thread, Wait, Waittill, Waittillmatch, Waittillframeend, Notify, Endon,
     Self, Level, Game, Anim, Animtree, Usingtree, KwTrue, KwFalse, Undefined,
     Vector, Breakpoint, ProfBegin, ProfEnd, Include,
 };

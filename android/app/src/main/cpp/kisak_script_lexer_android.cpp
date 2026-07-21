@@ -19,6 +19,7 @@ const std::unordered_map<std::string, KisakScriptKeyword>& KeywordTable() {
         {"continue", KisakScriptKeyword::Continue},
         {"return", KisakScriptKeyword::Return},
         {"thread", KisakScriptKeyword::Thread},
+        {"wait", KisakScriptKeyword::Wait},
         {"waittill", KisakScriptKeyword::Waittill},
         {"waittillmatch", KisakScriptKeyword::Waittillmatch},
         {"waittillframeend", KisakScriptKeyword::Waittillframeend},
@@ -297,6 +298,7 @@ std::string DescribeKeyword(KisakScriptKeyword keyword) {
         case KisakScriptKeyword::Continue: return "continue";
         case KisakScriptKeyword::Return: return "return";
         case KisakScriptKeyword::Thread: return "thread";
+        case KisakScriptKeyword::Wait: return "wait";
         case KisakScriptKeyword::Waittill: return "waittill";
         case KisakScriptKeyword::Waittillmatch: return "waittillmatch";
         case KisakScriptKeyword::Waittillframeend: return "waittillframeend";

@@ -175,7 +175,46 @@ private:
         if (CheckKeyword(KisakScriptKeyword::While)) return ParseWhile();
         if (CheckKeyword(KisakScriptKeyword::For)) return ParseFor();
         if (CheckKeyword(KisakScriptKeyword::Return)) return ParseReturn();
+        // Threading blueprint step 2: `thread`/`wait` are only recognized as
+        // these dedicated statement kinds when they are the VERY FIRST token
+        // of the statement — this is what naturally excludes object-prefixed
+        // `<expr> thread ...` (an expression precedes `thread` there, so this
+        // branch is never reached; it falls through to the ordinary
+        // expression-statement path below and fails there instead, with a
+        // clear "expected ';'"-style error, not a crash or silent misparse).
+        if (CheckKeyword(KisakScriptKeyword::Thread)) return ParseThreadCall();
+        if (CheckKeyword(KisakScriptKeyword::Wait)) return ParseWait();
         return ParseExpressionOrAssignmentStatement();
+    }
+
+    // Threading blueprint step 2: `thread <call-expr>;`. `thread` is purely
+    // a statement-level prefix wrapping an EXISTING call-expression
+    // production (bare `CallExpr` or namespaced `NamespacedCallExpr`) — no
+    // new call-parsing logic, ParsePrimary already handles both forms
+    // identically to how they parse without `thread` in front.
+    std::unique_ptr<KisakAstNode> ParseThreadCall() {
+        uint32_t line = CurLine();
+        Advance();  // 'thread'
+        auto node = MakeNode(Kind::ThreadCallStatement, line);
+        auto callExpr = ParsePrimary();
+        if (failed_) return node;
+        if (callExpr->kind != Kind::CallExpr && callExpr->kind != Kind::NamespacedCallExpr) {
+            Fail("'thread' must be followed by a function call");
+            return node;
+        }
+        node->children.push_back(std::move(callExpr));
+        ExpectOp(";");
+        return node;
+    }
+
+    // Threading blueprint step 2: `wait <expr>;`.
+    std::unique_ptr<KisakAstNode> ParseWait() {
+        uint32_t line = CurLine();
+        Advance();  // 'wait'
+        auto node = MakeNode(Kind::WaitStatement, line);
+        node->children.push_back(ParseExpression());
+        ExpectOp(";");
+        return node;
     }
 
     std::unique_ptr<KisakAstNode> ParseIf() {
@@ -652,6 +691,8 @@ std::string DescribeAstNodeKind(KisakAstNodeKind kind) {
         case Kind::ForStatement: return "ForStatement";
         case Kind::ReturnStatement: return "ReturnStatement";
         case Kind::ExpressionStatement: return "ExpressionStatement";
+        case Kind::ThreadCallStatement: return "ThreadCallStatement";
+        case Kind::WaitStatement: return "WaitStatement";
         case Kind::Assignment: return "Assignment";
         case Kind::BinaryExpr: return "BinaryExpr";
         case Kind::UnaryExpr: return "UnaryExpr";
