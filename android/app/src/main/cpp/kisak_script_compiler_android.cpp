@@ -116,6 +116,29 @@ struct CrossFileFixup {
     uint32_t line;
 };
 
+// Switch/loop-control blueprint (plans/android-gscript-switch-control-
+// flow.md) step 2: a compile-time-only "enclosing construct" context,
+// pushed/popped around EmitWhile/EmitFor's own bodies (and, from step 3
+// onward, EmitSwitch's own case-body block) -- NOT a runtime/VM concept,
+// purely compiler bookkeeping for break;/continue;. `break;` works
+// identically for all three kinds: a forward OP_jump, fixed up to "here"
+// once the whole construct's own code is emitted. `continue;`'s target
+// differs by kind -- corrected by adversarial review (H2) before any code
+// was written: a `while` loop's condition re-check position is KNOWN in
+// advance (an immediate backward jump), but a `for` loop's increment
+// clause is emitted AFTER the body, so `continue;` there is a forward
+// reference to a not-yet-emitted position and needs its own fixup list,
+// patched once EmitFor reaches the body/increment boundary. A `Switch`
+// context has no continue mechanism at all -- `continue;` inside a switch
+// must search PAST it to find an enclosing loop.
+enum class LoopOrSwitchKind : uint8_t { WhileLoop, ForLoop, Switch };
+struct LoopOrSwitchContext {
+    LoopOrSwitchKind kind;
+    std::vector<size_t> breakFixups;     // all kinds: forward OP_jump operands -> "here" at construct end
+    std::vector<size_t> continueFixups;  // ForLoop only: forward OP_jump operands -> the body/increment boundary
+    size_t whileCondTop = 0;             // WhileLoop only: known backward-jump target for continue
+};
+
 struct Compiler {
     // Reference (not owned) so several per-file Compiler instances can emit
     // into ONE shared program during a cross-file session — bytecode is
@@ -129,6 +152,14 @@ struct Compiler {
     // emitted. Per-file (a fresh Compiler per file), NOT shared.
     std::unordered_set<std::string> functionNames;
     std::vector<CallFixup> callFixups;
+
+    // Switch/loop-control blueprint step 2: the enclosing-construct stack
+    // break;/continue; resolve against. Per-function in spirit (cleared
+    // implicitly since it's always empty again at every function boundary
+    // in well-formed code -- push/pop is always balanced within one
+    // function body), but kept at Compiler scope like `locals` since this
+    // Compiler processes one function body at a time either way.
+    std::vector<LoopOrSwitchContext> loopSwitchStack;
 
     // Cross-file session state; all null in a single-file compile. When set,
     // this file's functions are ALSO registered under their qualified key, and
@@ -822,6 +853,11 @@ struct Compiler {
                 if (produced) EmitOp(Op::OP_DecTop);
                 break;
             }
+            // Switch/loop-control blueprint step 2: `break;`/`continue;`.
+            // See EmitBreak/EmitContinue and the LoopOrSwitchContext
+            // comment above for the full design.
+            case Kind::BreakStatement: EmitBreak(n); break;
+            case Kind::ContinueStatement: EmitContinue(n); break;
             // `wait <expr>;` -- emit the duration, then OP_wait (validates
             // type/range, documented no-op otherwise — step 1).
             case Kind::WaitStatement: {
@@ -1054,6 +1090,42 @@ struct Compiler {
         }
     }
 
+    // Switch/loop-control blueprint step 2: `break;` -- identical for
+    // while/for/switch (a forward OP_jump, fixed up to "here" once the
+    // TOP context's own construct finishes emitting). A stray break;
+    // outside any context is a specific compile error, never a crash.
+    void EmitBreak(const KisakAstNode& n) {
+        if (loopSwitchStack.empty()) {
+            Error(n.line, "'break' used outside any loop or switch");
+            return;
+        }
+        size_t at = EmitJumpPlaceholder();
+        loopSwitchStack.back().breakFixups.push_back(at);
+    }
+
+    // `continue;` -- searches from the TOP of the stack for the nearest
+    // LOOP entry (a `Switch` context is skipped, per Architecture fact 2 --
+    // a switch has no continue target of its own). `while`'s target is
+    // already known (an immediate backward jump); `for`'s is a forward
+    // reference resolved later by EmitFor itself (see its own comment).
+    // continue; found outside any loop (even if inside a switch with no
+    // enclosing loop) is a specific compile error.
+    void EmitContinue(const KisakAstNode& n) {
+        for (auto it = loopSwitchStack.rbegin(); it != loopSwitchStack.rend(); ++it) {
+            if (it->kind == LoopOrSwitchKind::WhileLoop) {
+                EmitJumpBackTo(it->whileCondTop, n.line);
+                return;
+            }
+            if (it->kind == LoopOrSwitchKind::ForLoop) {
+                size_t at = EmitJumpPlaceholder();
+                it->continueFixups.push_back(at);
+                return;
+            }
+            // Switch: continue is not meaningful here, keep searching outward.
+        }
+        Error(n.line, "'continue' used outside any loop");
+    }
+
     void EmitWhile(const KisakAstNode& n) {
         if (n.children.size() < 2 || !n.children[0] || !n.children[1]) {
             Error(n.line, "malformed while statement"); return;
@@ -1061,9 +1133,16 @@ struct Compiler {
         size_t top = here();
         EmitExpression(*n.children[0]);
         size_t jfalse = EmitJumpOnFalsePlaceholder();
+        LoopOrSwitchContext ctx;
+        ctx.kind = LoopOrSwitchKind::WhileLoop;
+        ctx.whileCondTop = top;
+        loopSwitchStack.push_back(std::move(ctx));
         EmitStatement(*n.children[1]);
+        LoopOrSwitchContext finished = std::move(loopSwitchStack.back());
+        loopSwitchStack.pop_back();
         EmitJumpBackTo(top, n.line);
         PatchForward16(jfalse, n.line);
+        for (size_t at : finished.breakFixups) PatchForward32(at);
     }
 
     void EmitFor(const KisakAstNode& n) {
@@ -1078,10 +1157,20 @@ struct Compiler {
             EmitExpression(*n.children[1]);
             jfalse = EmitJumpOnFalsePlaceholder();
         }
+        LoopOrSwitchContext ctx;
+        ctx.kind = LoopOrSwitchKind::ForLoop;
+        loopSwitchStack.push_back(std::move(ctx));
         if (n.children[3]) EmitStatement(*n.children[3]);
+        LoopOrSwitchContext finished = std::move(loopSwitchStack.back());
+        loopSwitchStack.pop_back();
+        // continue;'s forward-fixup resolution point: exactly HERE, between
+        // the body and the increment clause -- matching real C semantics
+        // (continue still runs the increment before the condition re-check).
+        for (size_t at : finished.continueFixups) PatchForward32(at);
         if (n.children[2]) EmitExprClause(*n.children[2]);
         EmitJumpBackTo(condTop, n.line);
         if (hasCond) PatchForward16(jfalse, n.line);
+        for (size_t at : finished.breakFixups) PatchForward32(at);
     }
 
     void EmitReturn(const KisakAstNode& n) {
