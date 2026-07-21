@@ -431,11 +431,47 @@ KisakWorldScene BuildWorldScene(const KisakZoneLoadResult& zone) {
         if (entryIndex >= 0 && entryIndex < stateBitsCount) {
             applyStateBits(state, view.U32(stateBitsTable, entryIndex * 8));
         } else {
-            // Reference techsets (empty shells) leave no technique to pick:
-            // merge every entry like the engine would never do, as a lenient
-            // fallback.
-            for (uint8_t bits = 0; bits < stateBitsCount; ++bits) {
-                applyStateBits(state, view.U32(stateBitsTable, bits * 8));
+            // Reference techsets (empty shells, comma-prefixed name, all 34
+            // technique slots null -- the real techset with actual technique
+            // bodies lives in a different, unscanned zone, same cross-zone-
+            // reference pattern as images/rawfiles elsewhere in this port) leave
+            // no technique to pick. Confirmed on real data (killhouse's own
+            // vehicle_humvee_camo_static/vehicle_tanker_truck materials, techset
+            // ',mc_l_sm_r0c0n0s0'): merging EVERY stateBits entry, as this
+            // fallback used to do, ORs together the base opaque pass (src=2/
+            // dst=1 on most entries) with clearly-secondary effect-pass entries
+            // (e.g. src=8/dst=2, src=1/dst=4) that a real multi-pass technique
+            // would draw as additional passes ON TOP of the opaque base, not as
+            // one merged draw call. Since this renderer only draws one pass per
+            // surface, that merge made the whole surface blended and it rendered
+            // solid black (alpha-blended against nothing, drawn in the blended
+            // pass last, over the vehicle's specular/gloss alpha channel rather
+            // than real translucency). Using just the FIRST entry's blend/
+            // alpha-test fields instead is a conservative single-pass
+            // approximation -- state tables are base-pass-first, secondary
+            // passes after -- and correctly distinguishes an opaque body
+            // material (entry 0 = src2/dst1, e.g. vehicle_humvee_camo_static's
+            // mc/mtl_american_humvee) from a genuinely translucent one (entry 0
+            // = src5/dst6+atest, e.g. the SAME model's mc/mtl_american_humvee_
+            // glass, a DIFFERENT, smaller, distinctly-blended stateBits array --
+            // this isn't a coincidence to paper over, the two materials simply
+            // carry different real data).
+            //
+            // Cull is handled separately: killhouse's viewmodel_winchester1200
+            // (the equipped gun) shares this EXACT SAME 7-entry stateBits blob,
+            // byte-for-byte, with the humvee body -- proof this array is a
+            // generic/shared placeholder attached to many reference-shell
+            // materials, not meaningful per-material state. Entry 0's cull bit
+            // (back-face culling on) is a fine default for a closed vehicle
+            // body but visibly wrong for a thin, single-sided viewmodel mesh
+            // viewed at point-blank range (missing polygon chunks). Since cull
+            // state from this generic blob can't be trusted either way, always
+            // force double-sided here rather than trust entry 0's cull bit --
+            // the safe default for an unresolved material, and it costs an
+            // opaque prop nothing to draw both faces.
+            if (stateBitsCount != 0) {
+                applyStateBits(state, view.U32(stateBitsTable, 0));
+                state.cullNone = true;
             }
         }
         return state;
