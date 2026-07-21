@@ -555,3 +555,58 @@ self-test's one `spawn("script_model", 12, 34, 56)` call produced
 World rendered with zero regression on the same device pass (killhouse:
 255 static models / 12225 instances / 8694 surfaces, matching every prior
 session's baseline exactly), crash buffer empty throughout.
+
+## Addendum — arrays blueprint (`plans/android-gscript-arrays.md`), step 4 findings
+
+**A genuine surprise, investigated per this step's own instruction not to
+silently accept a surprising result**: the arrays blueprint's Objective
+predicted killhouse/bog_a/cargoship would each fail at the SAME LINE as
+before (204/71/10) but with a different error CATEGORY (parse error ->
+the pre-existing compile-time entity-deferred rejection on their
+`level.<field>` target). Re-running the real, whole files after steps 1-3
+landed shows something better: **the failure LINE itself moves**, well
+past the old array-literal line, to a NEW gap entirely:
+
+| Level | Old failure (pre-arrays) | New failure (post-arrays step 3) |
+|---|---|---|
+| killhouse | line 204, parse error on `[]` | line 221, parse error: `thread` has no grammar production |
+| bog_a | line 71, parse error on `[]` | line 89, parse error: `thread` |
+| cargoship | line 10, parse error on `[]` | line 158, parse error: `thread` |
+| hunted | line 5, `#`-directive | line 5, unchanged (no array construct blocks it) |
+
+**Why**: `CompileGscSource` lexes+parses the WHOLE file as one `Program`
+(every `FunctionDef` in one pass) and only proceeds to the compile stage
+if parsing succeeds for the ENTIRE file — a single parse error anywhere
+aborts before compilation of any function is attempted. The plan's own
+Objective was written against an ISOLATED, synthetic reproduction of the
+`level.field[key]` construct (correct in isolation — a real, compile-time
+entity-deferred rejection, confirmed by this step's own test), not the
+real whole file. In the real whole file, once `[]`/`[key]` parse (steps
+1-3), parsing sails straight past EVERY `level.field[key]`/plain-array
+use between the old and new failure lines (dozens of lines in killhouse's
+case) and only stops at the next genuinely unparseable construct — which
+turns out to be `thread` (this port's parser has no grammar production
+for it at all) in all three files. This means threading is the REAL
+next blocker for all three real mission scripts now, one level earlier
+than the `level.field` rejection the arrays plan expected to be the
+visible stopping point — matches `gscript-vm-gaps.md`'s own priority
+order (arrays, then entity/object model, then threading) landing exactly
+where predicted, just discovered a step sooner than expected.
+
+Isolated real-corpus snippet checks (small, self-contained programs, not
+the whole file) confirm the array CONSTRUCT itself is correct wherever it
+appears, independent of the whole-file parse-gating behavior above:
+- `C4_models[ i ] hide();` (killhouse.gsc:332) and `aa[ i ] hide(); aa[ i ]
+  notsolid();` (:351-352) — subscript parses and reaches compilation
+  cleanly; rejected only by the separately-tracked, pre-existing
+  `MethodCallExpr` entity-deferred error, not an array error.
+- `targets[ selected_target ] thread moveTargetDummy( "raise" );`
+  (:998) — subscript is fine; rejected only by `thread` having no parser
+  production.
+- `tooslow_dialog = []; tooslow_dialog[0..3] = "...";` (:909-913, the
+  array's own real init line plus all 4 real assignments verbatim) —
+  fully compiles AND executes, all 4 string values round-trip correctly.
+- Array-parameter reference semantics (a callee overwriting an existing
+  key AND inserting a brand-new one, both visible in the caller's own
+  reference to the same array) — confirmed end-to-end, not just at the
+  unit level from step 1.
