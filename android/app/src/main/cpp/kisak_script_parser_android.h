@@ -86,6 +86,28 @@ enum class KisakAstNodeKind : uint8_t {
     // segments (empty for the no-path bare-`::` form). No children.
     FunctionRefExpr,
     FieldAccessExpr,       // text = field name; children[0] = object
+    // Arrays blueprint (plans/android-gscript-arrays.md) step 2. `[]` —
+    // ALWAYS empty (no children, no text): retail has no "array literal with
+    // initial elements" opcode, and no populated-literal syntax (`[1,2,3]`)
+    // appears anywhere in the real corpus. Only recognized where a PRIMARY
+    // expression is expected — `[` immediately after another expression is
+    // ArrayIndexExpr (subscript) below, not this.
+    ArrayLiteralExpr,
+    // `base[key]` — children[0] = base expression, children[1] = key
+    // expression. A postfix operator, chainable (`a[i][j]` parses). Whether
+    // this is a read or an assignment target is decided at the COMPILER
+    // level (mirroring how FieldAccessExpr assignment-target detection
+    // already works) — the parser always produces the same node shape.
+    ArrayIndexExpr,
+    // `base.size` — children[0] = base expression, no text. Deliberately its
+    // OWN node kind, NOT FieldAccessExpr: retail's `.size` is `OP_size`, a
+    // dedicated single-operand opcode (Scr_EvalSizeValue) completely
+    // separate from the generic field-access system (OP_Eval*FieldVariable)
+    // this port's compiler defers for self/level/game/anim — reusing
+    // FieldAccessExpr here would risk `.size` being confused with, or
+    // accidentally exercising, that deferred boundary. Real corpus: always a
+    // bare property read (`x.size`), never `x.size()`.
+    ArraySizeExpr,
     IdentifierExpr,        // text = name (also used for self/level/game keyword references)
     IntLiteralExpr,        // intValue
     FloatLiteralExpr,      // floatValue

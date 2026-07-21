@@ -405,24 +405,55 @@ private:
         return ParsePostfix();
     }
 
-    // Primary expression plus a `.field` access chain (field access only —
-    // method calls are recognized one level up, at statement/assignment-rhs
+    // Primary expression plus a `.field`/`.size`/`[key]` postfix chain
+    // (method calls are recognized one level up, at statement/assignment-rhs
     // scope, since they need to know they're not inside a nested
     // sub-expression position in this subset — matching real GSC's own
     // restriction that method calls are themselves statement-level, not
     // nested as a general sub-expression, e.g. `x = self setModel(y);` is
     // not valid GSC in the first place).
+    //
+    // Arrays blueprint (plans/android-gscript-arrays.md) step 2 added `[key]`
+    // (chainable, e.g. `a[i][j]`) and `.size`. `.size` is deliberately its own
+    // node kind (ArraySizeExpr), not FieldAccessExpr — see the node kind's own
+    // doc comment for why keeping it separate from the deferred entity-field
+    // boundary matters. Real corpus: `.size` is always a bare property read,
+    // never `.size(...)` — if a `(` ever follows the identifier `size`, fall
+    // through to ordinary FieldAccessExpr instead (consistent with how every
+    // other field name is handled here; this function never itself looks for
+    // a trailing call, that's the one-level-up job described above).
     std::unique_ptr<KisakAstNode> ParsePostfix() {
         auto expr = ParsePrimary();
-        while (!failed_ && CheckOp(".")) {
-            uint32_t line = CurLine();
-            Advance();
-            std::string field;
-            if (!ExpectIdentifier(field)) return expr;
-            auto node = MakeNode(Kind::FieldAccessExpr, line);
-            node->text = field;
-            node->children.push_back(std::move(expr));
-            expr = std::move(node);
+        while (!failed_) {
+            if (CheckOp(".")) {
+                uint32_t line = CurLine();
+                Advance();
+                std::string field;
+                if (!ExpectIdentifier(field)) return expr;
+                if (field == "size" && !CheckOp("(")) {
+                    auto node = MakeNode(Kind::ArraySizeExpr, line);
+                    node->children.push_back(std::move(expr));
+                    expr = std::move(node);
+                    continue;
+                }
+                auto node = MakeNode(Kind::FieldAccessExpr, line);
+                node->text = field;
+                node->children.push_back(std::move(expr));
+                expr = std::move(node);
+                continue;
+            }
+            if (CheckOp("[")) {
+                uint32_t line = CurLine();
+                Advance();
+                auto key = ParseExpression();
+                if (!ExpectOp("]")) return expr;
+                auto node = MakeNode(Kind::ArrayIndexExpr, line);
+                node->children.push_back(std::move(expr));
+                node->children.push_back(std::move(key));
+                expr = std::move(node);
+                continue;
+            }
+            break;
         }
         return expr;
     }
@@ -567,6 +598,24 @@ private:
                     if (!ExpectIdentifier(funcName)) return MakeNode(Kind::UndefinedLiteralExpr, line);
                     return ParseNamespacedTail(line, {}, funcName);
                 }
+                if (tok.text == "[") {
+                    // Arrays blueprint step 2: `[]` is the ONLY array-literal
+                    // form (retail has no populated-literal opcode, and no
+                    // `[1,2,3]`-style syntax appears anywhere in the real
+                    // corpus). A `[` reaching THIS point (where a primary
+                    // expression is expected) is only ever the literal, never
+                    // a subscript — subscript (`base[key]`) is recognized as a
+                    // postfix operator in ParsePostfix, one level up, only
+                    // after another expression has already been parsed.
+                    Advance();
+                    if (MatchOp("]")) {
+                        return MakeNode(Kind::ArrayLiteralExpr, line);
+                    }
+                    Fail("populated array literals ('[expr, ...]') don't exist in real GSC "
+                         "and are not supported (plans/android-gscript-arrays.md) — "
+                         "build the array with [] then assign each element by key");
+                    return MakeNode(Kind::UndefinedLiteralExpr, line);
+                }
                 Fail("unexpected operator '" + tok.text + "' in expression");
                 return MakeNode(Kind::UndefinedLiteralExpr, line);
             default:
@@ -611,6 +660,9 @@ std::string DescribeAstNodeKind(KisakAstNodeKind kind) {
         case Kind::NamespacedCallExpr: return "NamespacedCallExpr";
         case Kind::FunctionRefExpr: return "FunctionRefExpr";
         case Kind::FieldAccessExpr: return "FieldAccessExpr";
+        case Kind::ArrayLiteralExpr: return "ArrayLiteralExpr";
+        case Kind::ArrayIndexExpr: return "ArrayIndexExpr";
+        case Kind::ArraySizeExpr: return "ArraySizeExpr";
         case Kind::IdentifierExpr: return "IdentifierExpr";
         case Kind::IntLiteralExpr: return "IntLiteralExpr";
         case Kind::FloatLiteralExpr: return "FloatLiteralExpr";
