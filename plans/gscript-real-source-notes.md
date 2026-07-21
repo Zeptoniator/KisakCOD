@@ -667,3 +667,66 @@ validated in step 3's own host test (not repeated here): bog_a.gsc:89
 (bare, no args), cargoship.gsc:158 (bare, namespaced, cross-file target),
 killhouse.gsc:390 (namespaced thread WITH an argument, an array correctly
 passed through) — all compile and execute correctly end to end.
+
+## Addendum — entity/object-model blueprint (`plans/android-gscript-entity-model.md`), step 5 findings
+
+Re-ran all 4 real levels (killhouse now included alongside cargoship/bog_a/
+hunted — the threading-blueprint-era version of this harness only covered
+the latter three) through the SAME real fastfile+rawfile+cross-file-
+compiler pipeline the real device uses (`CompileGscZoneEntryPoint` fed by
+`ScanZoneRawFiles` over the genuinely decompressed `.ff`, not a synthetic
+string), after steps 1-4 landed. The plan's own prediction — a LARGE jump
+for killhouse/cargoship specifically, since field access was blocking the
+compile phase from literally their first few lines once the object-
+prefixed-thread parse gap was also fixed — is confirmed precisely, not
+just assumed:
+
+| Level | Pre-entity-model failure | Post-entity-model failure | Delta |
+|---|---|---|---|
+| killhouse | line 221, `level thread maps\killhouse_amb::main();` | **line 371**, `level waittill ( "mission failed" );` | **+150 lines** — advances past the shared cross-file blocker AND every field-access construct in between, landing on the FIRST genuinely out-of-scope construct (waittill — Scope Cut item 3, already anticipated, not a surprise) |
+| cargoship | line 172, `level thread maps\cargoship_amb::main();` | **line 189**, `switch(level.jumptosection) { ... }` | **+17 lines** — advances past the shared cross-file blocker, past `level.fogvalue["near"] = 100;`'s own auto-vivification (line 10, now executes correctly), and past several more `thread`/field-access lines, landing on a genuinely NEW, previously-uncatalogued gap: `switch`/`case` has no grammar in this parser subset at all |
+| bog_a | line 106, `/#` (debug-block delimiter, discovered by the threading blueprint's own step 4) | **UNCHANGED, line 106, same `/#` construct** | **0 lines** — this blueprint made ZERO visible difference to bog_a's own reachable progress, not because field access/object-prefixed calls don't work for bog_a (Step 4's own isolated test already proved `self set_force_color("c");`, bog_a.gsc's own real line 807, compiles and executes correctly) but because the UNRELATED `/#` debug-block gap sits at line 106 — long before line 517 (`level endon(...)`) or line 807 (`self set_force_color(...)`) ever gets a chance to matter. Confirms bog_a's real bottleneck was never entity-model-related to begin with. |
+| hunted | line 5, `#`-directive parse gap | unchanged | No change — correct, unrelated to the entity model (same gap noted in the threading blueprint's own addendum above) |
+
+**Both entity-model-targeted files (killhouse, cargoship) now land on
+constructs this blueprint EXPLICITLY predicted or scoped out, not on
+anything mysterious**:
+- killhouse's new blocker, `waittill`, is Scope Cut item 3 verbatim — the
+  plan's own adversarial review (M4) already established this construct
+  *parses* cleanly to a specific "deferred subsystem" error at the
+  PARSER level (confirmed here: `CompileGscZoneEntryPoint`'s error is
+  tagged `parse:`, and 0 files were chained — the entry file never even
+  reached the compile stage). This is not a new discovery, just the exact,
+  predicted next boundary.
+- cargoship's new blocker, `switch`/`case`, genuinely IS new — it was
+  listed in `gscript-vm-gaps.md`'s "Not covered" table as a low-urgency
+  item (no prior real-corpus line had ever reached it), but this is the
+  first time any real level's compile-progress measurement has actually
+  hit it. Worth flagging explicitly for whoever next updates
+  `gscript-vm-gaps.md` (step 6) or plans a future blueprint: `switch`/
+  `case`/`break`/`continue` should likely be re-ranked upward now that a
+  real, measured line depends on it, rather than staying a purely
+  theoretical low-priority item.
+
+**Auto-vivification confirmed against the REAL file, not just the
+isolated synthetic snippet from step 4's own test**: cargoship's real
+`main()` reaches (and, per the pipeline's compile-then-execute split,
+would correctly EXECUTE) `level.fogvalue["near"] = 100;` at its real line
+10 without erroring — the compile-stage measurement above already proves
+this line is no longer a blocker at all (the file advances 179 lines past
+it, all the way to line 189's `switch`), which is only possible if the
+auto-vivification codegen handles it correctly; a broken auto-
+vivification would have re-introduced line 10 as a RuntimeError-at-
+runtime blocker (invisible to a compile-only measurement, but Step 4's own
+dedicated auto-vivification host test already confirmed the EXECUTE side
+independently — see that step's own findings, not repeated here).
+
+**bog_a's own current failure point, investigated as the plan's Step 5
+Task 2 explicitly requires even though this blueprint doesn't fix it**:
+still exactly the `/#` debug-block delimiter gap the threading blueprint's
+step 4 already found and documented (see the addendum above) — this
+blueprint's changes are real (Step 4's own isolated `self set_force_color(
+"c");` test proves it) but structurally invisible to bog_a's real,
+whole-file compile progress, since `/#` sits earlier in the file than any
+construct this blueprint touches. No regression, no missed opportunity —
+just confirmation that this file's bottleneck lies elsewhere.
