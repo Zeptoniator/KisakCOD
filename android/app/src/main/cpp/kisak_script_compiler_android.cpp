@@ -48,9 +48,14 @@
 //    `::func`/`::func(...)` forms, no filename prefix) are same-file by
 //    definition and resolve via the SAME tiers as an ordinary CallExpr/
 //    IdentifierExpr — see EmitNamespacedCall/EmitFunctionRef below. A
-//    NON-empty path is cross-file, out of scope until step 5's cross-file
-//    model exists — a specific, clearly-labeled compile error for now, not
-//    a silent misresolution.
+//    NON-empty path is cross-file: resolvable ONLY inside a cross-file
+//    compile session (CompileGscZoneEntryPoint, step 4), where the target
+//    file's functions get registered into program.qualifiedFunctionEntryPoints
+//    and a cross-file backpatch (parallel to CallFixup, keyed by
+//    (canonical-file, funcname)) links the call site once that file is
+//    emitted. Outside such a session (the plain single-file CompileGscAst/
+//    CompileGscSource path, which has no other files to look in) a non-empty
+//    path is still a specific compile error, not a silent misresolution.
 
 namespace {
 
@@ -83,8 +88,10 @@ struct FunctionLocals {
     }
 };
 
-// A pending OP_ScriptFunctionCall codepos operand: patch `at` (4 bytes) with
-// the callee's entry offset once all functions are emitted.
+// A pending OP_ScriptFunctionCall/OP_GetFunction codepos operand: patch `at`
+// (4 bytes) with the callee's entry offset once all functions are emitted.
+// SAME-FILE only — the callee is a bare name resolved against this file's own
+// functionEntryPoints at the end of this file's compile pass.
 struct CallFixup {
     size_t at;
     std::string callee;
@@ -92,15 +99,46 @@ struct CallFixup {
     uint32_t line;
 };
 
+// The cross-file analogue of CallFixup (step 4): a pending codepos operand
+// whose target lives in a DIFFERENT file, identified by its fully-qualified
+// "canonical/path.gsc::funcname" key. Resolved against the shared program's
+// qualifiedFunctionEntryPoints only after EVERY file in the session is emitted,
+// so a forward reference (file A -> a function in file B compiled after A)
+// links correctly. The emitted bytecode is byte-identical to a same-file call
+// (OP_ScriptFunctionCall/OP_GetFunction + a 4-byte absolute offset) — matching
+// retail, where local and far calls compile to the same opcode and only the
+// compile-time symbol lookup differs.
+struct CrossFileFixup {
+    size_t at;
+    std::string qualified;   // "canonical/path.gsc::funcname"
+    std::string inFile;      // canonical name of the referencing file
+    std::string inFunction;
+    uint32_t line;
+};
+
 struct Compiler {
-    KisakScriptProgram program;
+    // Reference (not owned) so several per-file Compiler instances can emit
+    // into ONE shared program during a cross-file session — bytecode is
+    // appended, offsets stay absolute, the string pool and both symbol tables
+    // are shared. Single-file callers pass a program they own locally.
+    KisakScriptProgram& program;
     std::vector<std::string> errors;
 
     // All function names in the program (populated in pre-scan) — lets a call
     // resolve a forward-referenced same-file function before its body is
-    // emitted.
+    // emitted. Per-file (a fresh Compiler per file), NOT shared.
     std::unordered_set<std::string> functionNames;
     std::vector<CallFixup> callFixups;
+
+    // Cross-file session state; all null in a single-file compile. When set,
+    // this file's functions are ALSO registered under their qualified key, and
+    // a NON-empty-path reference emits a cross-file call + a CrossFileFixup
+    // (into the shared list) + a precache entry, instead of erroring.
+    const std::string* curCanonical = nullptr;      // this file's canonical name
+    std::vector<CrossFileFixup>* crossFixups = nullptr;  // shared across files
+    std::vector<std::string>* precache = nullptr;        // referenced files, this file only
+
+    explicit Compiler(KisakScriptProgram& p) : program(p) {}
 
     // Per-function emit state.
     const std::string* curFunction = nullptr;
@@ -460,17 +498,32 @@ struct Compiler {
     // Step 2's bare-`::func`/`::func(...)` forms (empty stringList, no
     // filename) are same-file by construction — resolve exactly like an
     // ordinary call. EmitCall only reads n.text/n.children, not n.kind, so
-    // it works unchanged for a NamespacedCallExpr node too. A non-empty
-    // path is cross-file, out of scope until step 5.
+    // it works unchanged for a NamespacedCallExpr node too. A NON-empty path
+    // is cross-file: inside a cross-file session, emit a direct script call to
+    // the qualified target (a CrossFileFixup links it — see below); outside
+    // one, it is a compile error (nothing else to search).
     bool EmitNamespacedCall(const KisakAstNode& n) {
-        if (!n.stringList.empty()) {
-            Error(n.line, "namespaced call '" +
-                          JoinPath(n.stringList) + "::" + n.text +
-                          "(...)' needs cross-file resolution: not supported until "
-                          "step 5 of plans/android-gscript-namespaced-calls.md");
+        if (n.stringList.empty()) return EmitCall(n);
+        if (!crossFixups) {
+            Error(n.line, "namespaced call '" + JoinBackslash(n.stringList) + "::" + n.text +
+                          "(...)' needs a cross-file compile session "
+                          "(CompileGscZoneEntryPoint); single-file compilation cannot "
+                          "resolve a reference into another file");
             return true;
         }
-        return EmitCall(n);
+        // A far call compiles exactly like a same-file script call (retail
+        // emits the identical OP_ScriptFunctionCall) — only the fixup differs:
+        // caller pushes a PreCodePos delimiter, args LEFT-TO-RIGHT, then the
+        // 4-byte codepos operand is backpatched to the qualified target.
+        EmitOp(Op::OP_PreScriptCall);
+        uint32_t argc = static_cast<uint32_t>(n.children.size());
+        for (uint32_t i = 0; i < argc; ++i) {
+            if (n.children[i]) EmitExpression(*n.children[i]);
+            else { EmitOp(Op::OP_GetUndefined); }
+        }
+        EmitOp(Op::OP_ScriptFunctionCall);
+        RecordCrossFileFixup(n);
+        return true;
     }
 
     // Step 2's bare `::func` value-reference form (FunctionRefExpr). Empty
@@ -478,20 +531,25 @@ struct Compiler {
     // backpatch mechanism a same-file CallExpr already gets (CallFixup is
     // generic over "a 4-byte codepos operand pointing at a same-Program
     // function" — it doesn't care whether the opcode before it was
-    // OP_ScriptFunctionCall or OP_GetFunction). Non-empty path = cross-file,
-    // out of scope until step 5.
+    // OP_ScriptFunctionCall or OP_GetFunction). NON-empty path = cross-file
+    // value reference: emit OP_GetFunction + a CrossFileFixup, resolvable only
+    // inside a cross-file session.
     bool EmitFunctionRef(const KisakAstNode& n) {
         if (!n.stringList.empty()) {
-            Error(n.line, "function reference '" +
-                          JoinPath(n.stringList) + "::" + n.text +
-                          "' needs cross-file resolution: not supported until "
-                          "step 5 of plans/android-gscript-namespaced-calls.md");
+            if (!crossFixups) {
+                Error(n.line, "function reference '" + JoinBackslash(n.stringList) + "::" +
+                              n.text + "' needs a cross-file compile session "
+                              "(CompileGscZoneEntryPoint); single-file compilation cannot "
+                              "resolve a reference into another file");
+                return true;
+            }
+            EmitOp(Op::OP_GetFunction);
+            RecordCrossFileFixup(n);
             return true;
         }
         if (!functionNames.count(n.text)) {
             Error(n.line, "unknown function: '::" + n.text +
-                          "' (no function so-named in this program; there is no "
-                          "cross-file linking in this step)");
+                          "' (no function so-named in this file)");
             return true;
         }
         EmitOp(Op::OP_GetFunction);
@@ -501,12 +559,42 @@ struct Compiler {
         return true;
     }
 
-    static std::string JoinPath(const std::vector<std::string>& segments) {
+    // Emit the 4-byte placeholder for a cross-file target and register it in the
+    // shared fixup list + this file's precache list. Precondition: crossFixups
+    // and precache are set (cross-file session), and n.stringList is non-empty.
+    void RecordCrossFileFixup(const KisakAstNode& n) {
+        std::string canonical = CanonicalGscName(n.stringList);
+        std::string qualified = canonical + "::" + n.text;
+        size_t at = here();
+        EmitU32(0);
+        crossFixups->push_back({at, qualified, curCanonical ? *curCanonical : "",
+                                curFunction ? *curFunction : "", n.line});
+        precache->push_back(canonical);
+    }
+
+    // Path segments as written in .gsc source use backslash; kept only for
+    // human-facing error messages (`maps\_blackhawk::main`).
+    static std::string JoinBackslash(const std::vector<std::string>& segments) {
         std::string out;
         for (size_t i = 0; i < segments.size(); ++i) {
             if (i) out += "\\";
             out += segments[i];
         }
+        return out;
+    }
+
+    // Canonical rawfile name: segments joined with "/" plus ".gsc" — verified
+    // against real killhouse.ff rawfile names (source `maps\killhouse_fx::main`
+    // -> rawfile "maps/killhouse_fx.gsc"). Filenames are NOT unique across a
+    // zone (killhouse_fx appears at both maps/ and maps/createfx/), which is
+    // why the full path is preserved rather than just the leaf.
+    static std::string CanonicalGscName(const std::vector<std::string>& segments) {
+        std::string out;
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (i) out += "/";
+            out += segments[i];
+        }
+        out += ".gsc";
         return out;
     }
 
@@ -637,7 +725,14 @@ struct Compiler {
     // ---- function + program emission ----
     void EmitFunction(const KisakAstNode& fn) {
         curFunction = &fn.text;
-        program.functionEntryPoints[fn.text] = static_cast<uint32_t>(here());
+        uint32_t entry = static_cast<uint32_t>(here());
+        program.functionEntryPoints[fn.text] = entry;
+        // In a cross-file session, ALSO register the qualified key so other
+        // files (and the entry-point lookup) can find this function past the
+        // bare-name clobbering that shared compilation causes.
+        if (curCanonical) {
+            program.qualifiedFunctionEntryPoints[*curCanonical + "::" + fn.text] = entry;
+        }
 
         // Fixed local frame (decision #1): parameters, then discovered body
         // locals. Params are created newest-last so parameter i lands at
@@ -714,10 +809,9 @@ struct Compiler {
 }  // namespace
 
 KisakScriptCompileResult CompileGscAst(const KisakAstNode& program) {
-    Compiler c;
-    c.Compile(program);
     KisakScriptCompileResult result;
-    result.program = std::move(c.program);
+    Compiler c(result.program);  // emit directly into the result's program
+    c.Compile(program);
     result.errors = std::move(c.errors);
     return result;
 }
@@ -731,4 +825,71 @@ KisakScriptCompileResult CompileGscSource(const std::string& source) {
         return result;
     }
     return CompileGscAst(*parsed.program);
+}
+
+KisakScriptCrossFileCompileResult CompileGscZoneEntryPoint(
+    const std::string& entryCanonicalName, const KisakScriptFileLoader& loadFile) {
+    KisakScriptCrossFileCompileResult result;
+    result.entryCanonical = entryCanonicalName;
+
+    std::vector<CrossFileFixup> crossFixups;  // shared across every file's Compiler
+    std::unordered_set<std::string> compiled;  // canonical names already emitted
+    std::unordered_set<std::string> scheduled{entryCanonicalName};
+    std::vector<std::string> worklist{entryCanonicalName};
+
+    // FIFO over the transitive closure of referenced files: the entry file
+    // first, then each newly-referenced file in discovery order. Same-file
+    // forward references are resolved inside each file's own Compile() pass
+    // (CallFixup); cross-file forward references are deferred to the backpatch
+    // pass below, after every file has registered its qualified functions.
+    while (!worklist.empty()) {
+        std::string canonical = worklist.front();
+        worklist.erase(worklist.begin());
+        if (!compiled.insert(canonical).second) continue;
+
+        std::optional<std::string> source = loadFile(canonical);
+        if (!source) {
+            // Matches retail's CompileError("Could not find script '%s'"). This
+            // is EXACTLY what a reference like maps\_blackhawk::main() produces,
+            // since _blackhawk.gsc is in no zone this port scans — expected, not
+            // a bug in this driver.
+            result.errors.push_back("could not find script '" + canonical + "'");
+            continue;
+        }
+        KisakScriptParseResult parsed = ParseGscSource(*source);
+        if (parsed.program == nullptr || !parsed.errors.empty()) {
+            for (const auto& e : parsed.errors)
+                result.errors.push_back(canonical + " parse: " + e);
+            if (parsed.errors.empty())
+                result.errors.push_back(canonical + " parse: failed with no message");
+            continue;
+        }
+
+        std::vector<std::string> filePrecache;
+        Compiler c(result.program);
+        c.curCanonical = &canonical;
+        c.crossFixups = &crossFixups;
+        c.precache = &filePrecache;
+        c.Compile(*parsed.program);
+        for (const auto& e : c.errors) result.errors.push_back(canonical + ": " + e);
+
+        for (const std::string& ref : filePrecache) {
+            if (scheduled.insert(ref).second) worklist.push_back(ref);
+        }
+    }
+
+    // Cross-file backpatch: every deferred (file,func) call site, resolved now
+    // that all files have registered their qualified entry offsets.
+    for (const CrossFileFixup& fx : crossFixups) {
+        auto it = result.program.qualifiedFunctionEntryPoints.find(fx.qualified);
+        if (it == result.program.qualifiedFunctionEntryPoints.end()) {
+            result.errors.push_back(fx.inFile + ": function " + fx.inFunction + ", line " +
+                                    std::to_string(fx.line) +
+                                    ": cross-file call to undefined function '" +
+                                    fx.qualified + "'");
+            continue;
+        }
+        std::memcpy(&result.program.bytecode[fx.at], &it->second, 4);
+    }
+    return result;
 }

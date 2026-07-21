@@ -178,7 +178,22 @@ struct KisakScriptProgram {
     // Function name -> byte offset into bytecode of that function's first
     // instruction. Populated by the compiler (step 8); step 3's synthetic
     // test harness can also populate it by hand for hand-assembled tests.
+    // BARE (unqualified) name only, so it is same-file scoped by nature: when
+    // several files are compiled into one shared program (namespaced-calls
+    // blueprint step 4), files that define the same bare name (e.g. two
+    // `main`s) overwrite each other here — that is fine, because same-file
+    // resolution reads this map only at the moment its own file is being
+    // emitted (before the next file clobbers it), and cross-file callers use
+    // the qualified table below instead. Single-file callers are unaffected.
     std::unordered_map<std::string, uint32_t> functionEntryPoints;
+    // Cross-file qualified function table: "canonical/path.gsc::funcname" ->
+    // byte offset. Empty for ordinary single-file compiles; populated ONLY by
+    // the cross-file driver (CompileGscZoneEntryPoint, step 4), which is the
+    // only lookup that survives bare-name clobbering across files. Keyed by a
+    // flat combined string rather than a nested map because the compiler emits
+    // one lookup per call site and a single hash beats two; the "::" separator
+    // matches the real .gsc reference syntax it is derived from.
+    std::unordered_map<std::string, uint32_t> qualifiedFunctionEntryPoints;
     // String literal pool: OP_GetString's 2-byte operand indexes into this.
     // A minimal stand-in for retail's global interned-string table (SL_*),
     // introduced in step 4 (not step 2/3) because it's the first step whose
