@@ -490,8 +490,8 @@ struct Compiler {
         }
         Error(n.line, "unknown function/builtin: '" + n.text +
                       "' (no builtin by that name, no function so-named in this program, "
-                      "and no local variable by that name to call through; "
-                      "there is no cross-file linking in this step)");
+                      "and no local variable by that name to call through; a bareword call "
+                      "never resolves cross-file — use the path\\file::func(...) syntax for that)");
         return true;
     }
 
@@ -872,6 +872,7 @@ KisakScriptCrossFileCompileResult CompileGscZoneEntryPoint(
         c.precache = &filePrecache;
         c.Compile(*parsed.program);
         for (const auto& e : c.errors) result.errors.push_back(canonical + ": " + e);
+        result.compiledFiles.push_back(canonical);
 
         for (const std::string& ref : filePrecache) {
             if (scheduled.insert(ref).second) worklist.push_back(ref);
@@ -890,6 +891,7 @@ KisakScriptCrossFileCompileResult CompileGscZoneEntryPoint(
             continue;
         }
         std::memcpy(&result.program.bytecode[fx.at], &it->second, 4);
+        ++result.crossFileCallsResolved;
     }
     return result;
 }

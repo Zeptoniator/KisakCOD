@@ -888,6 +888,73 @@ void CompileAndRunScript(const std::string& label, const std::string& source) {
     );
 }
 
+// Namespaced-calls blueprint (plans/android-gscript-namespaced-calls.md) step
+// 5: cross-file-aware sibling of CompileAndRunScript for a script extracted
+// from a real zone. `loadFile` looks up a referenced file by exactly the same
+// canonical name convention rf.name already uses (forward-slash + ".gsc",
+// verified against real killhouse.ff rawfile names in step 4) — so a
+// namespaced call/function-ref reaching into another rawfile in the SAME zone
+// now resolves. Still cannot reach a file absent from every zone this port
+// ever scans: maps\_blackhawk::main() (killhouse.gsc line 209) will surface
+// as a specific "could not find script" compile error, matching this plan's
+// own documented scope cut (see the plan's Objective section) — not a bug
+// here, and not something step 6's device validation should treat as one.
+void CompileAndRunScriptFromZone(
+    const std::string& gscName,
+    const std::vector<KisakZoneRawFile>& rawFiles,
+    const std::vector<uint8_t>& zoneData) {
+    KisakScriptFileLoader loadFile =
+        [&rawFiles, &zoneData](const std::string& canonical) -> std::optional<std::string> {
+            for (const KisakZoneRawFile& rf : rawFiles) {
+                if (rf.name != canonical) continue;
+                if (rf.contentOffset + rf.length > zoneData.size()) return std::nullopt;
+                return std::string(
+                    reinterpret_cast<const char*>(zoneData.data() + rf.contentOffset), rf.length);
+            }
+            return std::nullopt;
+        };
+    KisakScriptCrossFileCompileResult compiled = CompileGscZoneEntryPoint(gscName, loadFile);
+    if (!compiled.errors.empty()) {
+        std::string msg;
+        for (size_t i = 0; i < compiled.errors.size() && i < 5; ++i) {
+            if (i) msg += " | ";
+            msg += compiled.errors[i];
+        }
+        __android_log_print(ANDROID_LOG_WARN, kLogTag,
+            "Step9 script '%s': COMPILATION ECHOUEE (%zu erreurs, %zu fichiers chaines): %s",
+            gscName.c_str(), compiled.errors.size(), compiled.compiledFiles.size(), msg.c_str());
+        return;
+    }
+    auto mainIt = compiled.program.qualifiedFunctionEntryPoints.find(compiled.entryCanonical + "::main");
+    if (mainIt == compiled.program.qualifiedFunctionEntryPoints.end()) {
+        __android_log_print(ANDROID_LOG_WARN, kLogTag,
+            "Step9 script '%s': compile OK (%zu octets, %zu fichiers) mais aucune fonction main()",
+            gscName.c_str(), compiled.program.bytecode.size(), compiled.compiledFiles.size());
+        return;
+    }
+    ResetKisakScriptSpawnedEntities();
+    KisakScriptVm vm;
+    vm.logFn = [](const std::string& line) {
+        __android_log_print(ANDROID_LOG_INFO, kLogTag, "Step9 script print: %s", line.c_str());
+    };
+    KisakScriptExecResult exec = vm.Execute(compiled.program, mainIt->second);
+    const char* statusName =
+        exec.status == KisakScriptExecStatus::Completed ? "Completed" :
+        exec.status == KisakScriptExecStatus::RuntimeError ? "RuntimeError" :
+        exec.status == KisakScriptExecStatus::UnsupportedOpcode ? "UnsupportedOpcode" : "Aborted";
+    const size_t chainedExtra = compiled.compiledFiles.empty() ? 0 : compiled.compiledFiles.size() - 1;
+    __android_log_print(
+        exec.status == KisakScriptExecStatus::Completed ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+        kLogTag,
+        "Step9 script '%s': compile OK (%zu octets), chain-compiled %zu fichiers additionnels, "
+        "%zu appels inter-fichiers resolus, main() -> %s%s%s, entites spawnees=%zu",
+        gscName.c_str(), compiled.program.bytecode.size(), chainedExtra,
+        compiled.crossFileCallsResolved, statusName,
+        exec.message.empty() ? "" : " msg=", exec.message.c_str(),
+        GetKisakScriptSpawnedEntities().size()
+    );
+}
+
 // Hand-written script (NOT extracted from any real .gsc file — noted
 // explicitly, matching step 8's own precedent) exercising the parts of the
 // pipeline the real level script structurally cannot reach yet: locals,
@@ -969,22 +1036,21 @@ void StartWorldLoad(const std::string& mapName) {
 
                 // Then the real map's own main script, found by name in the
                 // same rawfile scan already used for step 1's diagnostic dump.
+                // Namespaced-calls blueprint step 5: use the cross-file-aware
+                // path so namespaced calls/function refs into other rawfiles
+                // of this SAME zone (e.g. killhouse_fx, killhouse_anim,
+                // createart/killhouse_art) can resolve, instead of the
+                // single-file CompileGscSource path used before this step.
                 const std::string gscName = "maps/" + mapName + ".gsc";
                 bool found = false;
                 for (const KisakZoneRawFile& rf : rawFiles) {
                     if (rf.name != gscName) continue;
                     found = true;
-                    if (rf.contentOffset + rf.length > zoneData.size()) {
-                        __android_log_print(ANDROID_LOG_WARN, kLogTag,
-                            "Step9 script '%s': rawfile trouve mais hors bornes", gscName.c_str());
-                        break;
-                    }
-                    const std::string source(
-                        reinterpret_cast<const char*>(zoneData.data() + rf.contentOffset), rf.length);
-                    CompileAndRunScript(gscName, source);
                     break;
                 }
-                if (!found) {
+                if (found) {
+                    CompileAndRunScriptFromZone(gscName, rawFiles, zoneData);
+                } else {
                     __android_log_print(ANDROID_LOG_WARN, kLogTag,
                         "Step9 script '%s': introuvable dans les rawfiles de cette zone", gscName.c_str());
                 }

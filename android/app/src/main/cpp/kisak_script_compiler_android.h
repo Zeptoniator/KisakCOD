@@ -32,6 +32,22 @@
 // syntax (`self setModel(...)`), and bare references to self/level/game/anim.
 // Building that object model is a genuinely new subsystem (step 9+), not a
 // small opcode gap to patch into step 3 here.
+//
+// Call-name resolution order (namespaced-calls blueprint, steps 3-5), overall
+// across the whole compiler — NOT a single per-call-site search order, since
+// which tier applies is a SYNTACTIC distinction (does the AST node carry a
+// path?), matching retail's ENUM_local_function/ENUM_function vs
+// ENUM_far_function split:
+//   1. Builtin table (KisakScriptFindBuiltinIndex) — bareword calls only.
+//   2. Same-file function (this Program's functionEntryPoints) — bareword.
+//   3. Local variable holding a FunctionRef (step 3's deliberate simplification
+//      beyond real GSC) — bareword.
+//   4. Cross-file (canonical-file, funcname) table (step 4's
+//      qualifiedFunctionEntryPoints, step 5 wires it into the real level-load
+//      path) — ONLY for a NamespacedCallExpr/FunctionRefExpr node with a
+//      non-empty path; a bareword call never falls through to this tier, and
+//      a namespaced (non-empty-path) node never falls through to tiers 1-3.
+//   Anything else: compile error, not a silent no-op.
 
 // Result envelope — matches the plain result-struct error model established by
 // step 3 (VM), step 6 (lexer) and step 7 (parser): no exceptions, no longjmp.
@@ -95,6 +111,15 @@ struct KisakScriptCrossFileCompileResult {
     KisakScriptProgram program;
     std::vector<std::string> errors;
     std::string entryCanonical;  // canonical name the compile started from
+    // Every canonical file actually compiled, in discovery order, entry file
+    // first. Diagnostic only (namespaced-calls blueprint step 5's real-device
+    // logging: "chain-compiled N additional files") — size()-1 is the count of
+    // files pulled in beyond the entry file, since entry is always [0].
+    std::vector<std::string> compiledFiles;
+    // Count of CrossFileFixup entries that resolved successfully (i.e. found
+    // in program.qualifiedFunctionEntryPoints at backpatch time). Does not
+    // include fixups that produced an "undefined function" error.
+    size_t crossFileCallsResolved = 0;
 };
 
 // Compile `entryCanonicalName` (e.g. "maps/killhouse.gsc") and the transitive
