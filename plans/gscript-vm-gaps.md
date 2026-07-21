@@ -37,8 +37,12 @@ inequality/less/greater/less_equal/greater_equal/inc/dec`), unary (`CastBool/
 BoolNot/BoolComplement`), `NOP/abort`, builtin dispatch (`CallBuiltin0-5/
 CallBuiltin`), arrays (`EmptyArray/EvalArray/EvalArrayRef/size` — see the
 arrays blueprint entry below; `ClearArray`/the cached-local-read variants
+remain unimplemented, deliberately, per that blueprint's own scope cut),
+bare threading (`ScriptThreadCall/wait` — see the threading blueprint
+entry below; `waittillFrameEnd/waittill/waittillmatch/notify/endon/
+ScriptMethodThreadCall/ScriptThreadCallPointer/ScriptMethodThreadCallPointer`
 remain unimplemented, deliberately, per that blueprint's own scope cut).
-**74 of 138 real opcodes implemented** (counted directly against
+**76 of 138 real opcodes implemented** (counted directly against
 `KisakScriptOpcode`'s 139 entries minus the `OP_count` sentinel).
 
 **Builtins** (`KisakScriptBuiltinTable()`, 12 entries): `print`, `println`,
@@ -57,7 +61,10 @@ GSC's no-dot method-call syntax (`<object-expr> <bareword>(args)`),
 (`[]` literal — always empty, no populated-literal syntax exists in real
 GSC; `expr[key]` subscript, chainable, both read and assignment-target
 contexts; `expr.size`, its own AST node kind, deliberately separate from
-the deferred `.field` entity-model boundary).
+the deferred `.field` entity-model boundary), bare threading (`thread
+funcName(args);` / `thread path\file::func(args);` — no object prefix;
+`wait <expr>;`, including a fix to promote `wait` from a plain Identifier
+to a real keyword, a genuine gap from the original lexer step).
 
 **Entity classnames** (`kisak_script_entity_android.h`, map_ents dispatch):
 `script_model`, `trigger_multiple` — 2 of the real spawn table's ~25 entries
@@ -68,8 +75,10 @@ the deferred `.field` entity-model boundary).
 | Area | Gap | Why deferred | Where it would land |
 |---|---|---|---|
 | VM | Entity/object model: no `OP_GetSelf/GetLevel/GetGame/GetAnim`, no `OP_Eval*FieldVariable`/`OP_Set*FieldVariableField`, no `OP_CallBuiltinMethod*` | Genuinely new subsystem (a real `gentity_s`-equivalent + field storage), not an opcode-sized gap | New blueprint: "entity field access" |
-| Parser+VM | `thread`/`waittill`/`waittillmatch`/`waittillframeend`/`notify`/`endon`/`wait` — no thread/notify machinery at all, AND (newly confirmed, arrays blueprint step 4) `thread` has no PARSER grammar production whatsoever (`<obj> thread <call>(...)` is a hard parse error, "expected ';', got 'thread'" — not just a deferred VM/compiler rejection the way entity field access is). **Now the CONFIRMED, measured, immediate next blocker for real WHOLE-FILE parsing** on killhouse/bog_a/cargoship (all 3 hit this exact construct at their new post-arrays failure lines: 221/89/158 respectively) — since `CompileGscSource`/`CompileGscZoneEntryPoint` parse a file's ENTIRE `Program` before compiling any of it, a parser-level gap blocks strictly earlier than a compile-time-only gap (like entity field access) ever could, even if the latter is logically "hit first" in isolated snippets. | Needs a scheduler + notify-list model at the VM level, AND real parser grammar for `thread`/`waittill`/etc — a bigger lift than previously scoped as VM-only | New blueprint: "GScript threading" — **re-ranked to the top real-world priority below**, ahead of the entity/object model, based on this measured finding |
-| VM | `switch`/`case`/`default`/`break` (as a switch, not a loop-break — loops have no `break`/`continue` either) | Not attempted; `Opcode_t` has `OP_switch`/`OP_endswitch` unimplemented | Same blueprint as arrays, see below |
+| ~~Parser+VM~~ | ~~Bare `thread`/`wait`~~ | **COVERED (bare/self-implicit forms only)** as of `plans/android-gscript-threading.md` (2026-07-21, all 5 steps) — `thread funcName(args);`/`thread path\file::func(args);` (same-file and cross-file, both confirmed on real corpus) implemented as a documented, synchronous-inline simplification (no true concurrency — this port's VM has no per-frame re-entry point to suspend into); `wait <expr>;` validates its argument (matching retail's Int/Float/negative-rejection checks exactly) but is a documented no-op, no real delay modeled. `wait` was ALSO promoted from a plain Identifier to a real lexer keyword as part of this (a genuine pre-existing gap, not a deliberate omission — the lexer's own header comment already cited a real `wait .1;` example from this corpus). | — |
+| Parser+VM | **Object-prefixed** `<expr> thread funcName(...)` (needs a real `self`-binding mechanism) and `waittill`/`waittillmatch`/`waittillframeend`/`notify`/`endon` (every one requires a genuine `VAR_POINTER`-typed object argument) — explicitly deferred by the threading blueprint's own scope cut (~36 and ~52 real corpus sites respectively, vs. 133+80 covered). **Confirmed, post-threading, to be the CURRENT real blocker for 2 of 3 real levels**: killhouse (unchanged, line 221) and cargoship (advanced to line 172) both now hit the identical `level thread <target>::main();` construct as their next failure point. | Needs the entity/object model's `self` mechanism (a real addressable object value) before either can be meaningfully implemented — not an opcode-sized gap | Same blueprint as the VM entity model, see below |
+| Parser | `/# ... #/` — real COD4 GSC's debug-block delimiter (brackets debug-only code, e.g. AI pain-debugging hooks). **Newly discovered** (threading blueprint step 4, bog_a.gsc line 106) — never identified by any of the four prior blueprints' own research phases. This port's lexer currently tokenizes `/` and `#` as separate operators, not the paired delimiter retail's real grammar treats them as. | Not anticipated by any prior research pass — a genuine gap, not a deliberate scope cut | Likely a small, independent, mechanical fix (skip the bracketed block, similar to how `#include` is parsed-and-dropped today) — plausibly NOT entangled with the entity model at all, a possible easy win before that blueprint lands |
+| VM | `switch`/`case`/`default`/`break` (as a switch, not a loop-break — loops have no `break`/`continue` either) | Not attempted; `Opcode_t` has `OP_switch`/`OP_endswitch` unimplemented | New, small, standalone blueprint — genuinely independent of arrays/namespaced-calls/threading, none of which touched it; not yet the measured first-hit gap for any real level, so still low urgency |
 | ~~VM~~ | ~~Arrays~~ | **COVERED (plain-variable arrays only)** as of `plans/android-gscript-arrays.md` (2026-07-21, all 5 steps) — `Array` value type (shared_ptr-backed map, reference semantics matching retail's ref-counted `VAR_POINTER` arrays), `[]`/`[key]`/`.size` fully working for read AND write, both int- and string-keyed against the same array. Explicit, deliberate scope cut: `level.field[key]`/`self.field[key]` are NOT covered — still rejected by the pre-existing entity-model compile-time check (`kEntityDeferred`), same as plain `.field` assignment; that requires the entity/object-model blueprint, not this one. Compound assignment on an array element (`arr[key] += v`) is also explicitly rejected (no real corpus usage found) rather than risking a double-key-evaluation miscompile. | — |
 | VM | `OP_GetIString` (interned/localized strings) | No localization table; `&"KEY"` degrades to a plain `OP_GetString` (step 8) | Needs the real string/localize table, likely same effort as arrays |
 | VM | Vectors (`OP_GetVector`, `OP_vector`) | No vector literal grammar (step 7 never disambiguated `(x,y,z)` from a parenthesized expr) | Parser + VM value-type work, moderate |
@@ -159,6 +168,30 @@ rejected) only by the SEPARATELY-tracked, correctly-named, unrelated gap
 error. Full account in `plans/gscript-real-source-notes.md`'s arrays-step-4
 addendum.
 
+### Re-run after `android-gscript-threading.md` (step 4/5, 2026-07-21)
+
+Same 4 levels, after bare `thread`/`wait` moved from "not covered" to
+"covered" above. **A genuinely mixed result, not a uniform advance** —
+documented honestly rather than smoothed over:
+
+| Level | Method | New result | Delta |
+|---|---|---|---|
+| killhouse | **real device**, `StartWorldLoad` + `CompileAndRunScriptFromZone` | **UNCHANGED**, line 221: `level thread maps\killhouse_amb::main();` | No change — correct, object-prefixed thread is out of this plan's scope, exactly as predicted |
+| cargoship | host | Line 172: `level thread maps\cargoship_amb::main();` | Line 158 → 172 (14 more lines); lands on the **SAME object-prefixed thread construct as killhouse** |
+| bog_a | host | Line 106: `/#` (a debug-block delimiter, see the new gap row above) | Line 89 → 106 (17 more lines); a **genuinely NEW gap**, not another thread/wait construct |
+| hunted | host | Unchanged, line 5, `#`-directive | No change — correct, unrelated |
+
+**Two convergent, confirming data points**: killhouse and cargoship now
+hit the IDENTICAL next construct (object-prefixed `thread`), reinforcing
+that this is genuinely the highest-value next target for those two real
+scripts specifically, ahead of anything else. bog_a's own next blocker is
+architecturally unrelated to the entity model (a lex/parse-level debug-
+directive gap) — a plausible small, independent fix that doesn't need to
+wait for the entity-model blueprint at all.
+
+Full account, including the exact real source lines, in
+`plans/gscript-real-source-notes.md`'s threading-step-4 addendum.
+
 ## Device regression pass
 
 ### Original pass (step 10 of the VM port, 2026-07-20/21)
@@ -243,47 +276,68 @@ Hitscan fire/audio not re-attempted this pass (already flagged inconclusive
 twice before under synthetic input, unrelated code path, diminishing
 verification value from a third attempt).
 
+### Re-run after `android-gscript-threading.md` (step 5, 2026-07-21)
+
+Confirmed on-device (killhouse, fresh app relaunch): world rendering
+unchanged from the established baseline (vehicle body paint/camo textures,
+viewmodel weapon, buildings/props all correct). Script pipeline: `Step9
+script 'maps/killhouse.gsc': COMPILATION ECHOUEE (1 erreurs, 0 fichiers
+chaines): maps/killhouse.gsc parse: line 221: expected ';', got 'thread'`
+— exactly matching Step 4's host-confirmed finding, no discrepancy. Crash
+buffer empty throughout.
+
+**Fire/audio and the HUD move-stick were both actually confirmed working
+this pass**, a nice change from the last two passes' inconclusive results:
+a look-zone swipe unexpectedly also registered as a hitscan fire (`Tir:
+impact a 1886 u`, with a real `AAudio stream ouvert` line right alongside
+it — genuine audio playback, not just a logged intent), and a subsequent
+held swipe caught the HUD move-stick ring cleanly in a screenshot together
+with visible forward movement. None of this blueprint's commits touch
+touch/render/audio code, so this is additional confirming evidence of no
+regression, not something this blueprint can take credit for causing.
+
 ## Recommendation for whoever picks up the next blueprint
 
-Re-ranked 2026-07-21 after arrays shipped and were re-validated against
-real, whole-file data (see above) — **the ranking below is a genuine
-reversal from the previous version of this document**, based on a measured
-finding, not a re-guess: threading now confirmed as the single, common,
-immediate blocker for ALL THREE real mission scripts' whole-file parse,
-ahead of the entity/object model.
+Re-ranked 2026-07-21 after the threading blueprint (bare `thread`/`wait`)
+shipped and was re-validated against real, whole-file data (see above).
+Two real levels (killhouse, cargoship) now converge on the identical next
+construct — this is the clearest, most measured signal any blueprint in
+this series has produced so far.
 
-1. **Threading grammar + VM** (`thread`, `waittill`/`waittillmatch`/
-   `waittillframeend`/`notify`/`endon`/`wait`) — **promoted to the top
-   priority based on measured real-corpus data**, not assumption: killhouse,
-   bog_a, and cargoship ALL THREE now hit the exact same `thread`
-   parse-error as their new, post-arrays failure point (lines 221/89/158
-   respectively) — a genuine PARSER gap (no grammar production for `thread`
-   at all), which blocks whole-file parsing strictly earlier than any
-   compile-time-only gap (like entity field access) ever could, since
-   `CompileGscSource`/`CompileGscZoneEntryPoint` parse an entire file before
-   compiling any of it. This is a bigger lift than previously scoped (needs
-   real parser grammar for `thread`/`waittill`/etc, PLUS a VM-level
-   scheduler/notify-list model), but it is now the confirmed, measured
-   bottleneck for all real corpus progress, not a guess.
-2. **Entity/object model** (`self`/`level`/`game`, field access, `spawn`
-   returning something real) — still the biggest single subsystem, and
-   still the one every other real script eventually needs (once threading
-   grammar unblocks whole-file parsing, `level.field`/`self.field` accesses
-   throughout each real script's `main()` will be the very next thing
-   encountered, already correctly rejected today by the existing
-   `kEntityDeferred` compile-time check — this blueprint doesn't need to do
-   anything new to make that rejection correct, it already is, just not yet
-   the visible bottleneck since threading blocks earlier).
-3. Arrays' own remaining gap: `level.field[key]`/`self.field[key]` (arrays
+1. **Entity/object model** (`self`/`level`/`game`, field access, `spawn`
+   returning something real) — **the clear top priority**, confirmed by
+   two convergent real levels: killhouse (line 221) and cargoship (line
+   172) now BOTH fail on the identical object-prefixed `thread <target>::
+   main();` construct, which needs a real `self`-binding mechanism this
+   port doesn't have. This is also the biggest single subsystem and the
+   one every other real script eventually needs — `level.field`/
+   `self.field` accesses are already correctly rejected today by the
+   existing `kEntityDeferred` compile-time check, this blueprint doesn't
+   need to do anything new to make that correct, it just needs to REPLACE
+   the rejection with real behavior.
+2. **Object-prefixed `thread`** (`<expr> thread funcName(...)`) and
+   **`waittill`/`notify`/`endon`** — bundle this with the entity/object-
+   model blueprint above rather than a separate threading follow-up, since
+   all of them need the SAME `self`-binding mechanism the entity model
+   would build anyway; the bare-thread blueprint already proved out the
+   opcode-reuse pattern (`OP_ScriptThreadCall`, `OP_ScriptMethodThreadCall`'s
+   real-retail equivalent) these would extend.
+3. **`/# ... #/` debug-block delimiter** — **newly discovered** (threading
+   blueprint step 4, bog_a.gsc:106), architecturally UNRELATED to the
+   entity model (a lex/parse-level gap, likely a small mechanical fix). A
+   plausible quick, independent win for a future session that wants
+   something smaller than the entity-model blueprint — does not need to
+   wait for it.
+4. Arrays' own remaining gap: `level.field[key]`/`self.field[key]` (arrays
    ON entity fields) — resolved automatically once the entity/object model
-   above lands, since plain-variable arrays are already fully working;
-   no separate work needed here.
-4. `switch`/`case`/`default`/loop `break`/`continue` — still low measured
-   urgency (none of the 4 real scripts hit this FIRST, even after two
-   re-validation passes), but grouped with threading's control-flow work
-   if that blueprint's author wants to batch related grammar gaps.
-5. ~~Namespaced calls + function pointers~~ — **shipped**, see "Covered" above.
-6. ~~Arrays (plain-variable)~~ — **shipped**, see "Covered" above.
+   lands, since plain-variable arrays are already fully working; no
+   separate work needed here.
+5. `switch`/`case`/`default`/loop `break`/`continue` — still low measured
+   urgency (never the first-hit gap for any of the 4 real scripts across
+   three re-validation passes now).
+6. ~~Namespaced calls + function pointers~~ — **shipped**, see "Covered" above.
+7. ~~Arrays (plain-variable)~~ — **shipped**, see "Covered" above.
+8. ~~Bare threading (`thread`/`wait`)~~ — **shipped**, see "Covered" above.
 
 Full AI (`actor_*.cpp`) remains explicitly out of scope for all of the above
 — a separate blueprint again, per the original plan's own note.
