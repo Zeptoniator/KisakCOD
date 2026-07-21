@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -270,6 +272,54 @@ enum class KisakScriptValueType : uint8_t {
     // where `::foo` is evaluated as a VALUE and passed as an argument, not
     // called immediately). Produced by OP_GetFunction.
     FunctionRef,
+    // GScript arrays blueprint (plans/android-gscript-arrays.md), step 1:
+    // retail's VAR_ARRAY — a first-class associative container, either
+    // integer- or string-keyed (both against the SAME array, e.g. real corpus
+    // `level.fogvalue["near"]` vs. `angles[0]`). Deliberate simplification vs.
+    // retail's shared, ref-counted global variable pool (`scrVarGlob.
+    // variableList`, the same pool self/level/game/anim objects live in) --
+    // this port gives arrays their own self-contained, shared_ptr-backed map
+    // with no dependency on a generic entity/object system. Reference
+    // (not value) semantics, matching retail's ref-counted VAR_POINTER
+    // arrays: copying a KisakScriptValue::Array copies the shared_ptr, so
+    // `y = x; y[0] = 1;` mutates the SAME array `x` sees -- unlike every
+    // other variant above, which is trivially value-copied. Produced by
+    // OP_EmptyArray; read via OP_EvalArray; OP_EvalArrayRef (array-element
+    // assignment) is step 3's join-point responsibility, not this step's.
+    Array,
+};
+
+// Array key: GScript array subscripts are either an integer or a string
+// against the same associative structure (confirmed by real corpus: string
+// keys in `level.fogvalue["near"]`, integer keys in `angles[0]`/`C4_models[i]`
+// -- architecturally the SAME array type in retail, `Scr_EvalArray`/
+// `Scr_EvalArrayRef` branch on the key's runtime type, not the array's).
+// Ordering (all-int keys sort before all-string keys, then by natural order
+// within each group) only matters for map lookup/iteration order; GSC has no
+// `foreach`-style iteration in this port's grammar, so iteration order is not
+// a behavior any real script can observe today -- this ordering choice is
+// purely "whatever satisfies std::map's operator<", not a fidelity decision.
+struct KisakArrayKey {
+    bool isString = false;
+    int64_t intKey = 0;
+    std::string stringKey;
+
+    static KisakArrayKey FromInt(int64_t v) {
+        KisakArrayKey k;
+        k.intKey = v;
+        return k;
+    }
+    static KisakArrayKey FromString(std::string v) {
+        KisakArrayKey k;
+        k.isString = true;
+        k.stringKey = std::move(v);
+        return k;
+    }
+
+    bool operator<(const KisakArrayKey& other) const {
+        if (isString != other.isString) return other.isString;
+        return isString ? (stringKey < other.stringKey) : (intKey < other.intKey);
+    }
 };
 
 struct KisakScriptValue {
@@ -286,6 +336,12 @@ struct KisakScriptValue {
     // arithmetic semantics for no benefit (CodePos/PreCodePos, by contrast,
     // are pure markers with no payload at all, so they had nothing to reuse).
     uint32_t functionEntryOffset = 0;
+    // Dedicated payload for Array: shared_ptr, not a plain member map, so
+    // copying a KisakScriptValue::Array gives retail's reference semantics
+    // for free (copy the shared_ptr => share the underlying map) instead of
+    // deep-copying on every assignment/argument-pass, which would silently
+    // diverge from real GSC array-aliasing behavior.
+    std::shared_ptr<std::map<KisakArrayKey, KisakScriptValue>> arrayElements;
 
     static KisakScriptValue Undefined();
     static KisakScriptValue Int(int32_t v);
@@ -293,6 +349,7 @@ struct KisakScriptValue {
     static KisakScriptValue Str(std::string v);
     static KisakScriptValue Marker(KisakScriptValueType marker);
     static KisakScriptValue FunctionRef(uint32_t entryOffset);
+    static KisakScriptValue Array();
 
     bool IsNumeric() const { return type == KisakScriptValueType::Int ||
                                     type == KisakScriptValueType::Float; }

@@ -265,6 +265,13 @@ KisakScriptValue KisakScriptValue::FunctionRef(uint32_t entryOffset) {
     return out;
 }
 
+KisakScriptValue KisakScriptValue::Array() {
+    KisakScriptValue out;
+    out.type = KisakScriptValueType::Array;
+    out.arrayElements = std::make_shared<std::map<KisakArrayKey, KisakScriptValue>>();
+    return out;
+}
+
 bool KisakScriptValue::Truthy() const {
     switch (type) {
         case KisakScriptValueType::Int: return i != 0;
@@ -273,6 +280,10 @@ bool KisakScriptValue::Truthy() const {
         // constructed (there's no "null function pointer" state in this
         // trimmed VM) — matches retail treating VAR_FUNCTION as truthy.
         case KisakScriptValueType::FunctionRef: return true;
+        // An array (even empty) is always a valid, non-null value once
+        // constructed — same reasoning as FunctionRef above; retail's
+        // VAR_POINTER arrays have no "null array" state either.
+        case KisakScriptValueType::Array: return true;
         default: return false;
     }
 }
@@ -293,6 +304,10 @@ std::string KisakScriptValue::Describe() const {
         case KisakScriptValueType::FunctionRef:
             std::snprintf(buf, sizeof(buf), "function(@%u)", functionEntryOffset);
             return buf;
+        case KisakScriptValueType::Array:
+            std::snprintf(buf, sizeof(buf), "array[%zu]",
+                          arrayElements ? arrayElements->size() : size_t{0});
+            return buf;
     }
     return "<?>";
 }
@@ -311,6 +326,12 @@ std::string KisakScriptValue::AsString() const {
         case KisakScriptValueType::CodePos:
         case KisakScriptValueType::PreCodePos:
         case KisakScriptValueType::FunctionRef:
+        // No format-specific real-corpus usage found for print(array)/an
+        // array used as a string (setdvar, string concatenation, ...); empty
+        // string is the same safe, no-fake-content default already used for
+        // FunctionRef/CodePos/PreCodePos above, not a guess at retail's exact
+        // formatting.
+        case KisakScriptValueType::Array:
             return "";
     }
     return "";
@@ -376,11 +397,12 @@ void Builtin_IsString(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
         call.args.Get(0).type == KisakScriptValueType::String ? 1 : 0);
 }
 
-// GScr_IsArray (g_scr_main.cpp:1368): always false — this trimmed VM has no
-// array/OP_EvalArray support yet (steps 8+), so nothing can ever produce an
-// array-typed value to test true.
+// GScr_IsArray (g_scr_main.cpp:1368): arrays blueprint step 1 gives the VM a
+// real Array type (OP_EmptyArray/OP_EvalArray) — this builtin now reports it
+// correctly instead of the always-false stub it was before arrays existed.
 void Builtin_IsArray(KisakScriptBuiltinCall& call, KisakScriptLogFn) {
-    call.returnValue = KisakScriptValue::Int(0);
+    call.returnValue = KisakScriptValue::Int(
+        call.args.Get(0).type == KisakScriptValueType::Array ? 1 : 0);
 }
 
 // GScr_GetDvar (g_scr_main.cpp:1459): routed to the SAME dvar store the menu
@@ -748,6 +770,54 @@ void Interpreter::Run() {
                 push(KisakScriptValue::FunctionRef(cursor.ReadCodePos()));
                 break;
 
+            // Arrays blueprint (plans/android-gscript-arrays.md) step 1:
+            // `[]` -- always an EMPTY array (retail: Scr_AllocArray(),
+            // scr_vm.cpp:2420-2424; there is no "array literal with initial
+            // elements" opcode, and no populated-literal syntax exists
+            // anywhere in the real corpus -- confirmed by grep). This port's
+            // simplified version: no global variable pool, just a fresh
+            // shared_ptr<map>.
+            case KisakScriptOpcode::OP_EmptyArray:
+                push(KisakScriptValue::Array());
+                break;
+            // `array[key]` read (retail: Scr_EvalArray, scr_variable.cpp:
+            // 2814). This port controls both emission (compiler, step 3) and
+            // dispatch, so the stack order here (array pushed first, then
+            // key) is this port's own choice -- it does not mirror retail's
+            // specific fs.top/fs.top-1 layout, only the type-checked key
+            // handling below needs to match retail. Missing-key read pushes
+            // Undefined, NOT an error (retail: Scr_FindArrayIndex returns the
+            // miss slot, scr_variable.cpp:3486, and Scr_EvalVariable(0) reads
+            // the undefined sentinel for it, scr_variable.cpp:1678) -- the
+            // already-ported isdefined(arr[key]) builtin is an idiomatic
+            // real-GSC pattern that depends on a miss returning Undefined
+            // rather than erroring.
+            case KisakScriptOpcode::OP_EvalArray: {
+                KisakScriptValue key = pop();
+                if (stack.empty()) { RuntimeError("OP_EvalArray stack underflow"); return; }
+                KisakScriptValue arr = pop();
+                if (arr.type != KisakScriptValueType::Array) {
+                    RuntimeError("cannot subscript " + arr.Describe());
+                    return;
+                }
+                KisakArrayKey k;
+                if (key.type == KisakScriptValueType::Int) {
+                    k = KisakArrayKey::FromInt(key.i);
+                } else if (key.type == KisakScriptValueType::String) {
+                    k = KisakArrayKey::FromString(key.s);
+                } else {
+                    RuntimeError(key.Describe() + " is not an array index");
+                    return;
+                }
+                if (!arr.arrayElements) {
+                    push(KisakScriptValue::Undefined());
+                    break;
+                }
+                auto it = arr.arrayElements->find(k);
+                push(it != arr.arrayElements->end() ? it->second : KisakScriptValue::Undefined());
+                break;
+            }
+
             // ---- locals ----
             case KisakScriptOpcode::OP_CreateLocalVariable:
                 cursor.ReadUnsignedShort();  // name id (unused in this trimmed model)
@@ -1049,6 +1119,26 @@ void Interpreter::Run() {
                     return;
                 }
                 top().i = ~top().i;
+                break;
+            }
+            // Arrays blueprint step 1: `.size` (Scr_EvalSizeValue,
+            // scr_variable.cpp:2591) -- array element count, string length,
+            // else a runtime error. Retail has a THIRD case, a non-array
+            // VAR_POINTER (e.g. an entity ref) returning size 1 rather than
+            // erroring (scr_variable.cpp:2606) -- this port has no non-array
+            // pointer value yet, so that case cannot arise; a future entity-
+            // model step should revisit whether its new value type(s) need
+            // the same size==1 fallback instead of falling into RuntimeError.
+            case KisakScriptOpcode::OP_size: {
+                if (top().type == KisakScriptValueType::Array) {
+                    size_t n = top().arrayElements ? top().arrayElements->size() : 0;
+                    top() = KisakScriptValue::Int(static_cast<int32_t>(n));
+                } else if (top().type == KisakScriptValueType::String) {
+                    top() = KisakScriptValue::Int(static_cast<int32_t>(top().s.size()));
+                } else {
+                    RuntimeError("size cannot be applied to " + top().Describe());
+                    return;
+                }
                 break;
             }
 
