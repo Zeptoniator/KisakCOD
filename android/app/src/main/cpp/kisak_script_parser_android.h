@@ -80,6 +80,20 @@ enum class KisakAstNodeKind : uint8_t {
     UnaryExpr,             // text = operator; children[0] = operand
     CallExpr,              // text = function name; children = args
     MethodCallExpr,        // text = method name; children[0] = object, children[1..] = args
+    // Entity/object-model blueprint (plans/android-gscript-entity-model.md)
+    // step 3. `<expr> thread <call>;` -- the ONLY genuinely new grammar this
+    // blueprint's parser needs (Architecture fact 7, corrected): the NON-
+    // threaded object-prefixed call (`<expr> <bareword>(args)`) already
+    // parses as MethodCallExpr above with no new grammar at all. children[0]
+    // = the receiver expression (parsed via the ordinary postfix chain, same
+    // as MethodCallExpr's object), children[1] = the call being threaded
+    // (an ordinary CallExpr/NamespacedCallExpr from the EXISTING call
+    // grammar, exactly like bare ThreadCallStatement above reuses it --
+    // `thread` is purely a statement-level prefix here too, just preceded by
+    // a receiver expression this time instead of appearing as the first
+    // token of the statement). No `text` field (the call's own text/
+    // stringList already carry the function name/path).
+    MethodThreadCallStatement,
     // Namespaced-calls blueprint (plans/android-gscript-namespaced-calls.md)
     // step 2. text = function name; stringList = path segments (e.g.
     // `maps\_blackhawk::main()` -> stringList=["maps","_blackhawk"],

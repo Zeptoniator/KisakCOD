@@ -19,6 +19,21 @@ bool IsObjectKeyword(KisakScriptKeyword kw) {
            kw == KisakScriptKeyword::Game || kw == KisakScriptKeyword::Anim;
 }
 
+// Entity/object-model blueprint step 3, Task 3: waittill/notify/endon (and
+// their variants) are lexer KEYWORDS, not identifiers -- neither the
+// pre-existing MethodCallExpr production nor this step's new
+// MethodThreadCallStatement production can ever accept one as a call-target
+// (both require an Identifier-typed token), so `level notify(...)` etc.
+// already fail to parse today regardless of this helper. This is message-
+// quality polish only (a specific "deferred subsystem" error instead of a
+// generic "expected ';'"), NOT a safety mechanism preventing a miscompile
+// that adversarial review confirmed cannot occur.
+bool IsDeferredSubsystemKeyword(KisakScriptKeyword kw) {
+    return kw == KisakScriptKeyword::Waittill || kw == KisakScriptKeyword::Waittillmatch ||
+           kw == KisakScriptKeyword::Waittillframeend || kw == KisakScriptKeyword::Notify ||
+           kw == KisakScriptKeyword::Endon;
+}
+
 class Parser {
 public:
     explicit Parser(const std::vector<KisakScriptToken>& tokens) : tokens_(tokens) {}
@@ -284,7 +299,12 @@ private:
         uint32_t line = CurLine();
         auto expr = ParseExpressionOrAssignmentExpr();
         if (failed_) return nullptr;
-        if (expr && expr->kind == Kind::Assignment) {
+        // Entity/object-model blueprint step 3: MethodThreadCallStatement is
+        // returned as its own statement kind (like bare ThreadCallStatement
+        // at the top of ParseStatement), not wrapped in ExpressionStatement
+        // -- same treatment as Assignment above, extended by one clause.
+        if (expr && (expr->kind == Kind::Assignment ||
+                     expr->kind == Kind::MethodThreadCallStatement)) {
             ExpectOp(";");
             return expr;
         }
@@ -301,6 +321,37 @@ private:
         uint32_t line = CurLine();
         auto target = ParsePostfix();
         if (failed_) return nullptr;
+
+        // Entity/object-model blueprint step 3: `<expr> thread <call>;` --
+        // the ONLY genuinely new grammar this blueprint's parser needs. The
+        // non-threaded object-prefixed form (`self set_force_color("c")`)
+        // needs NO check here at all -- it already falls through to the
+        // pre-existing MethodCallExpr detection below unchanged. Checked
+        // BEFORE the MethodCallExpr lookahead (though order doesn't actually
+        // matter functionally: MethodCallExpr's check requires an Identifier
+        // token, and `thread` is a Keyword token, so the two can never both
+        // match the same input) for readability -- receiver-prefixed forms
+        // grouped together.
+        if (CheckKeyword(KisakScriptKeyword::Thread)) {
+            Advance();  // 'thread'
+            auto node = MakeNode(Kind::MethodThreadCallStatement, line);
+            // Reuses ParsePrimary() exactly like bare ThreadCallStatement
+            // does above it -- ParsePrimary already handles both bare
+            // (`funcName(args)`) and namespaced (`path\file::func(args)`)
+            // call forms identically whether or not a receiver preceded
+            // `thread`. Real corpus citations for this exact construct are
+            // namespaced (killhouse.gsc:221, cargoship_extract.gsc:172:
+            // `level thread maps\<file>::main();`).
+            auto callExpr = ParsePrimary();
+            if (failed_) return node;
+            if (callExpr->kind != Kind::CallExpr && callExpr->kind != Kind::NamespacedCallExpr) {
+                Fail("'thread' must be followed by a function call");
+                return node;
+            }
+            node->children.push_back(std::move(target));
+            node->children.push_back(std::move(callExpr));
+            return node;
+        }
 
         // Postfix ++/-- (e.g. `i++;`, real corpus usage confirmed —
         // codescripts/character.gsc). Maps directly to OP_inc/OP_dec,
@@ -345,6 +396,24 @@ private:
             call->children.push_back(std::move(target));
             ParseArgList(*call);
             return call;
+        }
+
+        // Entity/object-model blueprint step 3, Task 3: nothing above
+        // matched (not an assignment, not a threaded or bare method call),
+        // and the next token is one of waittill/waittillmatch/
+        // waittillframeend/notify/endon -- these already fail to parse no
+        // matter what (they're keywords, never Identifier-typed, so neither
+        // MethodCallExpr above nor MethodThreadCallStatement above it can
+        // ever accept one), but a specific, legible error here beats the
+        // generic "expected ';'" ExpectOp(";") would otherwise produce back
+        // in the caller. Message-quality polish only -- see
+        // IsDeferredSubsystemKeyword's own comment for why this is not a
+        // safety mechanism.
+        if (!AtEnd() && Peek().type == KisakScriptTokenType::Keyword &&
+            IsDeferredSubsystemKeyword(Peek().keyword)) {
+            Fail("'" + Peek().text + "' is a deferred subsystem, not yet supported by "
+                 "this grammar subset (plans/android-gscript-entity-model.md, Scope Cut item 3)");
+            return target;
         }
 
         return target;
@@ -698,6 +767,7 @@ std::string DescribeAstNodeKind(KisakAstNodeKind kind) {
         case Kind::UnaryExpr: return "UnaryExpr";
         case Kind::CallExpr: return "CallExpr";
         case Kind::MethodCallExpr: return "MethodCallExpr";
+        case Kind::MethodThreadCallStatement: return "MethodThreadCallStatement";
         case Kind::NamespacedCallExpr: return "NamespacedCallExpr";
         case Kind::FunctionRefExpr: return "FunctionRefExpr";
         case Kind::FieldAccessExpr: return "FieldAccessExpr";
