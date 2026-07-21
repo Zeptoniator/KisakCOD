@@ -52,7 +52,15 @@ that blueprint's own scope cut — the fast-path field variants are
 retail-only optimizations this port collapsed into the two generic
 opcodes above, not a coverage gap).
 **83 of 138 real opcodes implemented** (counted directly against
-`KisakScriptOpcode`'s 139 entries minus the `OP_count` sentinel).
+`KisakScriptOpcode`'s 139 entries minus the `OP_count` sentinel). **This
+count is UNCHANGED by the switch/loop-control blueprint** (`plans/android-
+gscript-switch-control-flow.md`, 2026-07-21, all 5 steps) — the first
+blueprint this session to add zero new opcodes: `switch`/`case`/`default`
+desugars into the EXISTING `equality`/`JumpOnTrue`/`jump` opcodes (a
+split-dispatch layout, not retail's own jump-table `OP_switch`/
+`OP_endswitch` encoding), and `break`/`continue` reuse the EXISTING
+`jump`/`jumpback` opcodes via compiler-only bookkeeping (a context stack),
+with no VM/runtime concept at all.
 
 **Builtins** (`KisakScriptBuiltinTable()`, 12 entries): `print`, `println`,
 `isdefined`, `isstring`, `isarray` (now genuinely checks the `Array` type —
@@ -77,7 +85,14 @@ contexts; `expr.size`, its own AST node kind, deliberately separate from
 the entity-model field-access mechanism), bare threading (`thread
 funcName(args);` / `thread path\file::func(args);` — no object prefix;
 `wait <expr>;`, including a fix to promote `wait` from a plain Identifier
-to a real keyword, a genuine gap from the original lexer step).
+to a real keyword, a genuine gap from the original lexer step),
+`switch (subject) { case V: ...; default: ...; }` with real C-style
+fallthrough (a case with no `break` falls into the next case's
+statements — confirmed against real cargoship_extract.gsc:189's own
+no-break cascade), both string- and integer-cased switches against the
+same subject type, an optional `default:` clause in any source position,
+and loop `break`/`continue` for both `while` and `for` — see the
+switch/loop-control row below.
 
 **Entity classnames** (`kisak_script_entity_android.h`, map_ents dispatch):
 `script_model`, `trigger_multiple` — 2 of the real spawn table's ~25 entries
@@ -112,6 +127,31 @@ object keyword (`level = x;`); cross-`Execute()`-call persistence of
 `level`/`game` (freshly allocated per `Execute()` call — unobservable
 today, since exactly one `Execute()` call happens per script trigger).
 
+**Switch/case/default + loop break/continue** (`plans/android-gscript-
+switch-control-flow.md`, 2026-07-21, all 5 steps): `switch (subject) {
+case V1: ...; case V2: ...; default: ...; }` desugared via a split-
+dispatch layout (a dispatch prologue of `EvalLocal/literal/OP_equality/
+OP_JumpOnTrue` comparisons, entirely separate from a contiguous body
+block emitted in source order) — this separation is what makes real
+fallthrough automatic, confirmed against cargoship_extract.gsc:189's own
+real no-break cascade (matching the first case runs every subsequent
+case's body too) and against `ally_sas_woodland_smg_mp5.gsc:26-41`'s
+break-stops-fallthrough shape. Both string- and integer-cased switches,
+a `default:` clause in any source position (confirmed working both last
+and non-last), a switch subject that is itself an arbitrary expression
+(evaluated exactly once into a hidden compiler-synthesized local slot).
+`break;`/`continue;` for both `while` and `for` loops via a compile-time-
+only context stack (no VM/runtime concept) — `for`'s `continue;` correctly
+still runs the increment clause before re-testing the condition; nested
+loops/switches each correctly target their OWN nearest enclosing
+construct. Zero new VM opcodes (see the opcode-count note above).
+Deliberate scope cuts: case labels are a plain int/string literal only
+(no computed values, matching every real corpus example); multiple case
+labels sharing one body (`case "a": case "b": ...`) is not supported (no
+real corpus usage found); switching on a non-Int/non-String subject
+(e.g. an Array or Object) is a clean `RuntimeError` via the existing
+`OP_equality` type check, matching retail's own restriction.
+
 ## Not covered (deliberate, documented boundaries — not bugs)
 
 | Area | Gap | Why deferred | Where it would land |
@@ -120,12 +160,12 @@ today, since exactly one `Execute()` call happens per script trigger).
 | ~~Parser+VM~~ | ~~Bare `thread`/`wait`~~ | **COVERED (bare/self-implicit forms only)** as of `plans/android-gscript-threading.md` (2026-07-21, all 5 steps) — `thread funcName(args);`/`thread path\file::func(args);` (same-file and cross-file, both confirmed on real corpus) implemented as a documented, synchronous-inline simplification (no true concurrency — this port's VM has no per-frame re-entry point to suspend into); `wait <expr>;` validates its argument (matching retail's Int/Float/negative-rejection checks exactly) but is a documented no-op, no real delay modeled. `wait` was ALSO promoted from a plain Identifier to a real lexer keyword as part of this (a genuine pre-existing gap, not a deliberate omission — the lexer's own header comment already cited a real `wait .1;` example from this corpus). | — |
 | ~~Parser+VM~~ | ~~Object-prefixed `<expr> thread funcName(...)`~~ | **COVERED** as of `plans/android-gscript-entity-model.md` — the exact shared blocker killhouse/cargoship converged on (`level thread maps\<file>::main();`) now compiles AND executes end to end, confirmed against both real levels via the full cross-file pipeline. `waittill`/`waittillmatch`/`waittillframeend`/`notify`/`endon` remain explicitly deferred (real thread-suspension semantics this port's synchronous VM has no scheduler for) — confirmed these are lexer keywords, structurally impossible to misparse as a call under any of this port's grammar, so a legible "deferred subsystem" message is all that's needed, not a safety mechanism. | — |
 | Parser | `/# ... #/` — real COD4 GSC's debug-block delimiter (brackets debug-only code, e.g. AI pain-debugging hooks). **Newly discovered** (threading blueprint step 4, bog_a.gsc line 106) — never identified by any of the four prior blueprints' own research phases. This port's lexer currently tokenizes `/` and `#` as separate operators, not the paired delimiter retail's real grammar treats them as. | Not anticipated by any prior research pass — a genuine gap, not a deliberate scope cut | Likely a small, independent, mechanical fix (skip the bracketed block, similar to how `#include` is parsed-and-dropped today) — plausibly NOT entangled with the entity model at all, a possible easy win before that blueprint lands |
-| VM | `switch`/`case`/`default`/`break` (as a switch, not a loop-break — loops have no `break`/`continue` either) | Not attempted; `Opcode_t` has `OP_switch`/`OP_endswitch` unimplemented | **Re-ranked upward** as of the entity-model blueprint's step 5 (2026-07-21): now the actual, measured first-hit gap for a real level for the first time across six blueprints' worth of real-corpus re-validation — cargoship advances all the way to line 189's `switch(level.jumptosection) { case "bridge": ... }` once entity-model field access + object-prefixed calls landed. Still a small, standalone blueprint, genuinely independent of everything shipped so far. |
+| ~~VM~~ | ~~`switch`/`case`/`default`/`break` (as a switch, not a loop-break — loops have no `break`/`continue` either)~~ | **COVERED** as of `plans/android-gscript-switch-control-flow.md` (2026-07-21, all 5 steps) — see the "Covered" paragraph above. Confirmed against real corpus: cargoship's own line-189 switch (the first real, measured first-hit gap any level had reached, per the entity-model blueprint's own step 5) now compiles and executes end to end, advancing the file 13 more lines to the next, already-documented, unrelated gap (`#using_animtree`, see its own row below). | — |
 | ~~VM~~ | ~~Arrays~~ | **COVERED (plain-variable arrays AND arrays-on-entity-fields)** as of `plans/android-gscript-arrays.md` (2026-07-21, all 5 steps, plain variables) + `plans/android-gscript-entity-model.md` (2026-07-21, step 4, arrays on self/level/game fields, INCLUDING auto-vivification on first indexed write to an unset field). `Array` value type (shared_ptr-backed map, reference semantics matching retail's ref-counted `VAR_POINTER` arrays), `[]`/`[key]`/`.size` fully working for read AND write, both int- and string-keyed against the same array, on plain locals AND on object fields alike. Compound assignment on an array element (`arr[key] += v`) is still explicitly rejected (no real corpus usage found) rather than risking a double-key-evaluation miscompile — compound assignment on a plain FIELD (no array), by contrast, IS covered (no key-expression to double-evaluate). | — |
 | VM | `OP_GetIString` (interned/localized strings) | No localization table; `&"KEY"` degrades to a plain `OP_GetString` (step 8) | Needs the real string/localize table, likely same effort as arrays |
 | VM | Vectors (`OP_GetVector`, `OP_vector`) | No vector literal grammar (step 7 never disambiguated `(x,y,z)` from a parenthesized expr) | Parser + VM value-type work, moderate |
 | ~~Parser~~ | ~~Namespaced calls (`path\file::func()`) and function pointers (`::func`)~~ | **COVERED** as of `plans/android-gscript-namespaced-calls.md` (2026-07-21, all 6 steps) — bare `::func`/same-file namespaced calls resolve via `FunctionRef`+`OP_GetFunction`/`OP_ScriptFunctionCallPointer`; cross-file namespaced calls resolve via `CompileGscZoneEntryPoint`'s qualified symbol table + cross-file backpatch, for any target file present in the SAME scanned zone. Still cannot resolve a call into a file absent from every zone this port ever scans (e.g. `maps\_blackhawk::main()`, a shared cross-mission script) — that is a data-availability limit, not a parser/compiler gap; see the plan's own Objective section. | — |
-| Parser | `#using_animtree(...)` and any other `#`-directive besides `#include` | Not anticipated when step 7 wrote `SkipIncludeDirective` — first real discovery this step (hunted.gsc line 5) | Small, mechanical parser fix |
+| Parser | `#using_animtree(...)` and any other `#`-directive besides `#include` | Not anticipated when step 7 wrote `SkipIncludeDirective` — first real discovery this step (hunted.gsc line 5) | Small, mechanical parser fix — **re-confirmed as a real, measured blocker a second time**: after the switch/loop-control blueprint (2026-07-21), cargoship's own line-189 switch now compiles cleanly and the file's NEW failure point (line 202) is this exact same construct, `#using_animtree("generic_human");` — the SAME gap hunted.gsc:5 already hits, not a new discovery. Now confirmed as the shared next blocker for 2 of 4 real levels. |
 | ~~Parser~~ | ~~Array subscript syntax~~ | **COVERED**, see the VM row above. | — |
 | ~~Compiler~~ | ~~Field access/assignment and method calls on `self`/`level`/`game`/`anim`~~ | **COVERED (self/level/game)** as of `plans/android-gscript-entity-model.md` — see the "Covered" paragraph above. `anim` remains rejected with a specific compile error (unused by the real corpus at every current failure boundary). | — |
 | Entities | Only `script_model`/`trigger_multiple` — no `trigger_once`, `trigger_hurt`, `trigger_use`, `light`, `misc_turret`, actors (`actor_*`), items, vehicles, etc. | Step 5 explicitly scoped to "one basic trigger class" + script_model | New blueprint: "full entity spawn" |
@@ -255,6 +295,27 @@ account, including exact real source lines and the auto-vivification
 cross-check, in `plans/gscript-real-source-notes.md`'s entity-model-step-5
 addendum.
 
+### Re-run after `android-gscript-switch-control-flow.md` (step 4, 2026-07-21)
+
+Same 4 levels, after switch/case/default + loop break/continue moved from
+"not covered" to "covered" above. **The plan's own headline claim — that
+cargoship's real line-189 switch blocker would resolve — confirmed
+precisely**:
+
+| Level | Method | New result | Delta |
+|---|---|---|---|
+| killhouse | host + real device (same finding) | Unchanged, line 371: `level waittill ( "mission failed" );` | No change — correct, unrelated to switch/loop-control |
+| cargoship | host | Parse fails line 202: `#using_animtree("generic_human");` | Line 189 → 202 (**+13 lines**) — the real switch (lines 189-198) now compiles cleanly end to end; the new blocker is NOT a new discovery, it's the SAME already-documented `#using_animtree` gap `hunted.gsc:5` already hits |
+| bog_a | host | Unchanged, line 106: `/#` | No change — the `/#` gap sits earlier than anything this blueprint touches; confirmed separately via an isolated snippet that bog_a's own real continue-in-for-loop idiom (bog_a_extract.gsc:613-619's structure) compiles and executes correctly |
+| hunted | host | Unchanged, line 5, `#using_animtree(...)` | No change — correct, and now literally the SAME construct as cargoship's own new blocker |
+
+**cargoship's real switch statement is confirmed fully resolved, not a
+coincidental advance**: the new failure line sits only 4 lines past the
+switch's own closing brace, with nothing else in between that could
+account for it. Full account, including the isolated bog_a continue test,
+in `plans/gscript-real-source-notes.md`'s switch-control-flow-step-4
+addendum.
+
 ## Device regression pass
 
 ### Original pass (step 10 of the VM port, 2026-07-20/21)
@@ -382,51 +443,76 @@ the GScript VM/compiler files), so this is judged the same synthetic-input
 timing flakiness already documented multiple times in this file, not a
 regression — flagged honestly rather than re-claimed as freshly verified.
 
+### Re-run after `android-gscript-switch-control-flow.md` (step 5, 2026-07-21)
+
+Confirmed on-device (killhouse, fresh app install + launch): world
+rendering unchanged from the established baseline (buildings, vehicles
+with correct opaque body/camo textures, viewmodel weapon, street props —
+screenshot-confirmed once the world scene finished building, ~90s after
+zone-asset load; an earlier screenshot taken mid-build correctly still
+showed the main menu, not a regression). Crash buffer empty (`crashcheck`
+clean) throughout. Script pipeline: `Step9 script 'maps/killhouse.gsc':
+COMPILATION ECHOUEE (1 erreurs, 0 fichiers chaines): maps/killhouse.gsc
+parse: line 371: 'waittill' is a deferred subsystem, ...` — exactly
+matching Step 4's host-confirmed finding, message and line both
+identical, no discrepancy. World/mission zone loaded fully (1684/1684
+assets).
+
+HUD move-stick/camera-look under synthetic input not independently
+re-tested this pass — this blueprint's commits touch only the GScript
+parser/compiler files (switch/case/break/continue), never touch/render/
+input code, so re-verifying an already-well-established, unrelated code
+path would add little beyond what prior passes already confirmed.
+
 ## Recommendation for whoever picks up the next blueprint
 
-Re-ranked 2026-07-21 after the entity/object-model blueprint (self/level/
-game field access + object-prefixed calls) shipped and was re-validated
-against real, whole-file data on both host and device (see above). This is
-the SIXTH GScript blueprint this session (namespaced-calls, arrays,
-threading, entity-model, in that order) — the remaining gap list is now
-short, and for the first time every item on it is either low-urgency or
-newly-discovered rather than a known convergent blocker.
+Re-ranked 2026-07-21 after the switch/loop-control blueprint (switch/case/
+default + loop break/continue) shipped and was re-validated against real,
+whole-file data on both host and device (see above). This is the SEVENTH
+GScript blueprint this session (namespaced-calls, arrays, threading,
+entity-model, switch/loop-control, in that order) — for the first time,
+**two of the four real levels (cargoship, hunted) now converge on the
+identical next construct**, the clearest, most measured signal since the
+threading blueprint's own killhouse/cargoship convergence.
 
-1. **`switch`/`case`/`default`/loop `break`/`continue`** — **the new top
-   priority**, promoted from "low measured urgency" to the FIRST real,
-   measured first-hit gap any real level has ever reached across six
-   blueprints' worth of re-validation: cargoship now advances all the way
-   to line 189's `switch(level.jumptosection) { case "bridge": ...}` once
-   entity-model field access unblocked everything before it. A small,
-   standalone blueprint — genuinely independent of every subsystem shipped
-   so far (arrays/namespaced-calls/threading/entity-model never touched
-   `OP_switch`/`OP_endswitch`, both still unimplemented).
+1. **`#using_animtree(...)` and other non-`#include` `#`-directives** —
+   **the new top priority**, promoted from "low measured urgency" to a
+   CONFIRMED CONVERGENT blocker: cargoship's own real line-202 construct
+   (reached only after the switch/loop-control blueprint unblocked
+   everything before it) is now the literal SAME construct as hunted.gsc's
+   own long-standing line-5 blocker. A small, mechanical parser fix
+   (`SkipIncludeDirective` currently only recognizes `#include`) —
+   genuinely independent of every subsystem shipped so far.
 2. **`waittill`/`notify`/`endon`/`waittillmatch`/`waittillframeend`** —
-   killhouse's own current blocker (line 371, `level waittill(...)`), the
-   FIRST real level to ever reach this construct as its measured next
-   gap. Needs real thread-suspension semantics this port's synchronous VM
-   has no scheduler for (the same architectural gap the threading
-   blueprint already identified for bare `thread`/`wait`) — a genuinely
-   new subsystem, not an opcode-sized patch. The entity/object model these
-   depend on (a real `self`/addressable-object argument) now EXISTS
-   (this blueprint), so this is more tractable than it was before, but
-   still needs its own scoping pass for the suspend/resume question.
+   killhouse's own current blocker (line 371, `level waittill(...)`,
+   UNCHANGED across this blueprint), the FIRST real level to ever reach
+   this construct as its measured next gap. Needs real thread-suspension
+   semantics this port's synchronous VM has no scheduler for (the same
+   architectural gap the threading blueprint already identified for bare
+   `thread`/`wait`) — a genuinely new subsystem, not an opcode-sized
+   patch. The entity/object model these depend on (a real
+   `self`/addressable-object argument) now EXISTS (entity-model
+   blueprint), so this is more tractable than it was before, but still
+   needs its own scoping pass for the suspend/resume question.
 3. **`/# ... #/` debug-block delimiter** — still open (threading
    blueprint step 4, bog_a.gsc:106), architecturally UNRELATED to
-   anything shipped since. Still bog_a's own actual current blocker (this
-   blueprint made zero visible difference to bog_a's real-file progress,
-   confirmed and explained above) — a plausible quick, independent win
-   for a future session, still doesn't need to wait for anything else.
-4. `OP_GetIString` (localized strings), vectors (`OP_GetVector`/`OP_vector`),
-   `#using_animtree(...)`/other `#`-directives, fuller entity spawn
-   coverage — all still open, all still lower-measured-urgency than the
-   three above (none has ever been the first-hit gap for any real level).
+   anything shipped since, including this blueprint (confirmed zero
+   visible difference to bog_a's real-file progress AGAIN — its own real
+   continue-heavy loop code is confirmed working in isolation, but the
+   whole-file blocker sits earlier in the file). Still a plausible quick,
+   independent win for a future session.
+4. `OP_GetIString` (localized strings), vectors (`OP_GetVector`/
+   `OP_vector`), fuller entity spawn coverage — all still open, all still
+   lower-measured-urgency than the three above (none has ever been the
+   first-hit gap for any real level).
 5. ~~Namespaced calls + function pointers~~ — **shipped**, see "Covered" above.
 6. ~~Arrays (plain-variable AND on entity fields, incl. auto-vivification)~~
    — **shipped**, see "Covered" above.
 7. ~~Bare threading (`thread`/`wait`)~~ — **shipped**, see "Covered" above.
 8. ~~Entity/object model (self/level/game field access + object-prefixed
    calls)~~ — **shipped**, see "Covered" above.
+9. ~~`switch`/`case`/`default` + loop `break`/`continue`~~ — **shipped**,
+   see "Covered" above.
 
 Full AI (`actor_*.cpp`) remains explicitly out of scope for all of the above
 — a separate blueprint again, per the original plan's own note.
