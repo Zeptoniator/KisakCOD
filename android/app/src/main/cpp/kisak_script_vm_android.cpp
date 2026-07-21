@@ -1005,6 +1005,63 @@ void Interpreter::Run() {
                 cursor.pos = entry;
                 break;
             }
+            // Threading blueprint (plans/android-gscript-threading.md) step 1:
+            // bare `thread funcName(args);`. Retail spawns an INDEPENDENTLY-
+            // scheduled execution context here (AllocThread, scr_vm.cpp:2860 -
+            // the caller continues immediately, the new thread runs
+            // concurrently, distinct from an ordinary nested call's
+            // AllocChildThread) and only later, at wait/waittill, actually
+            // suspends into a per-frame scheduler this port's VM has no
+            // concept of (Execute() is a single synchronous call-to-
+            // completion, invoked once per script trigger, no per-frame
+            // re-entry point -- see the plan's own Scope Cut section for why
+            // building real concurrency is explicitly out of scope). This
+            // port's documented simplification: dispatch is BYTE-IDENTICAL to
+            // OP_ScriptFunctionCall above -- the callee runs synchronously,
+            // right here, to completion, before the caller's next
+            // instruction. The compiler (step 3) discards the callee's return
+            // value with a trailing OP_DecTop, matching how any other
+            // statement-level call result is discarded (EmitExprClause) --
+            // there is no hook available at THIS opcode's own dispatch site
+            // to do that (the callee hasn't run yet; its return value only
+            // surfaces later, at its own OP_Return/OP_End).
+            case KisakScriptOpcode::OP_ScriptThreadCall: {
+                uint32_t entry = cursor.ReadCodePos();
+                if (frames.size() >= 32) { RuntimeError("script stack overflow"); return; }
+                Frame callee;
+                callee.returnPos = cursor.pos;
+                frames.push_back(std::move(callee));
+                cursor.pos = entry;
+                break;
+            }
+            // Threading blueprint step 1: `wait <expr>;`. Retail suspends the
+            // current thread until the given duration elapses (scr_vm.cpp:
+            // 2718-2759, OP_wait), resumed later by the same per-frame
+            // scheduler bare `thread` would need -- this port has no such
+            // scheduler (see above), so this is a documented no-op: validate
+            // the argument (matching retail's real, unambiguous checks
+            // exactly -- Int or Float only, negative rejected) then continue
+            // immediately, no delay modeled. Keeping the validation (even
+            // though the value itself is discarded) means no program that
+            // would be invalid in retail is silently accepted here either.
+            case KisakScriptOpcode::OP_wait: {
+                if (stack.empty()) { RuntimeError("OP_wait stack underflow"); return; }
+                KisakScriptValue duration = pop();
+                float seconds;
+                if (duration.type == KisakScriptValueType::Int) {
+                    seconds = static_cast<float>(duration.i);
+                } else if (duration.type == KisakScriptValueType::Float) {
+                    seconds = duration.f;
+                } else {
+                    RuntimeError("type " + duration.Describe() + " is not a float");
+                    return;
+                }
+                if (seconds < 0.0f) {
+                    RuntimeError("negative wait is not allowed");
+                    return;
+                }
+                break;
+            }
             // Namespaced-calls blueprint step 3: calls through a
             // previously-evaluated FunctionRef value (step 1) instead of an
             // embedded bytecode operand — same frame-push mechanics as
