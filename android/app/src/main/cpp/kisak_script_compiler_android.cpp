@@ -200,6 +200,15 @@ struct Compiler {
         EmitU16(0);
         return at;
     }
+    // Entity/object-model blueprint step 4: needed by the field-array
+    // auto-vivification codegen (EmitFieldArrayAutoVivify) -- mirrors
+    // EmitJumpOnFalsePlaceholder above exactly, just OP_JumpOnTrue.
+    size_t EmitJumpOnTruePlaceholder() {
+        EmitOp(Op::OP_JumpOnTrue);
+        size_t at = here();
+        EmitU16(0);
+        return at;
+    }
     // OP_jump's int32 operand is likewise relative to just-after the operand.
     size_t EmitJumpPlaceholder() {
         EmitOp(Op::OP_jump);
@@ -259,6 +268,26 @@ struct Compiler {
             EmitOp(Op::OP_EvalLocalVariableRefCached);
             EmitByte(static_cast<uint8_t>(cached));
         }
+    }
+
+    // ---- entity/object-model field eval / assign (step 4) ----
+    // Field read: emit the base object expression, then OP_EvalFieldVariable
+    // with the field name as a stringPool operand (Architecture fact 4 --
+    // encoded like OP_GetString's operand, not like OP_EvalArrayRef's
+    // runtime-popped key, since a field name is a compile-time constant).
+    void EmitFieldReadRaw(const KisakAstNode& fieldBase, uint16_t fieldId) {
+        EmitExpression(fieldBase);
+        EmitOp(Op::OP_EvalFieldVariable);
+        EmitU16(fieldId);
+    }
+    // Field write-ref: same operand convention, establishes a RefKind::
+    // ObjectField ref for the following OP_SetVariableField to consume.
+    // Pushes nothing -- unlike EmitFieldReadRaw, this pops the base object
+    // and leaves the stack as it was before.
+    void EmitFieldRef(const KisakAstNode& fieldBase, uint16_t fieldId) {
+        EmitExpression(fieldBase);
+        EmitOp(Op::OP_EvalFieldVariableRef);
+        EmitU16(fieldId);
     }
 
     // ---- pre-scan: discover every local a function assigns to ----
@@ -331,13 +360,25 @@ struct Compiler {
             case Kind::CallExpr: return EmitCall(n);
             case Kind::NamespacedCallExpr: return EmitNamespacedCall(n);
             case Kind::FunctionRefExpr: return EmitFunctionRef(n);
+            // Entity/object-model blueprint (plans/android-gscript-entity-model.md)
+            // step 4: object-prefixed call, non-threaded (e.g. bog_a_extract.gsc:
+            // 807's `self set_force_color("c");`). Always bareword -- the
+            // parser's MethodCallExpr lookahead (parser.cpp:337-348) can never
+            // produce a namespaced path -- so pathSegments is always empty here.
             case Kind::MethodCallExpr:
-                Error(n.line, "method call '" + n.text + "' needs an entity/object model: " +
-                              std::string(kEntityDeferred));
-                return true;
+                if (n.children.empty() || !n.children[0]) {
+                    Error(n.line, "malformed method call"); return true;
+                }
+                return EmitMethodCallLike(*n.children[0], n.text, {}, n, /*argsStart=*/1,
+                                          n.line, /*threaded=*/false);
+            // Entity/object-model blueprint step 4: generic field read
+            // (Architecture fact 4) -- reuses the existing OP_EvalFieldVariable
+            // opcode (Step 1).
             case Kind::FieldAccessExpr:
-                Error(n.line, "field access '." + n.text + "' needs an entity/object model: " +
-                              std::string(kEntityDeferred));
+                if (n.children.empty() || !n.children[0]) {
+                    Error(n.line, "malformed field access"); return true;
+                }
+                EmitFieldReadRaw(*n.children[0], InternString(n.text));
                 return true;
             default:
                 Error(n.line, "cannot compile expression node " +
@@ -357,7 +398,21 @@ struct Compiler {
 
     bool EmitIdentifierRead(const KisakAstNode& n) {
         if (IsEntityKeyword(n.text)) {
-            Error(n.line, "reference to '" + n.text + "': " + std::string(kEntityDeferred));
+            // Entity/object-model blueprint step 4: bare self/level/game
+            // reference -- reuses the existing OP_GetSelf/OP_GetLevel/
+            // OP_GetGame opcodes (Step 1). `anim` stays explicitly rejected
+            // (Scope Cut item 1: unused by the real corpus at every current
+            // failure boundary across all five blueprints' worth of
+            // validation this session) -- the VM has no OP_GetAnim handler
+            // at all, so emitting it here would only fail later, at
+            // runtime, with a confusing "unsupported opcode"; rejecting it
+            // here at compile time, with a clear reason, is more honest.
+            if (n.text == "self") { EmitOp(Op::OP_GetSelf); return true; }
+            if (n.text == "level") { EmitOp(Op::OP_GetLevel); return true; }
+            if (n.text == "game") { EmitOp(Op::OP_GetGame); return true; }
+            Error(n.line, "reference to 'anim' is out of scope (plans/android-gscript-"
+                          "entity-model.md, Scope Cut item 1 -- unused by the real corpus "
+                          "at every current failure boundary; self/level/game are supported)");
             return true;
         }
         if (!locals.Has(n.text)) {
@@ -624,6 +679,88 @@ struct Compiler {
         precache->push_back(canonical);
     }
 
+    // Entity/object-model blueprint step 4: shared codegen for both
+    // object-prefixed call forms -- MethodCallExpr (non-threaded, always
+    // bareword: the parser's lookahead at parser.cpp:337-348 only ever
+    // fires on a plain Identifier, never a namespaced path) and Step 3's
+    // MethodThreadCallStatement (threaded, bareword OR namespaced -- wraps
+    // an ordinary CallExpr/NamespacedCallExpr from the pre-existing call
+    // grammar, e.g. killhouse.gsc:221's `level thread maps\killhouse_amb::
+    // main();`). Unlike EmitCall's bareword resolution, real GSC's
+    // method-call syntax NEVER targets a builtin (builtins take no implicit
+    // receiver) and this port's local-FunctionRef-pointer tier has no
+    // receiver-rebinding opcode either (OP_ScriptMethodCallPointer/
+    // OP_ScriptMethodThreadCallPointer are deliberately unimplemented, Step
+    // 2) -- only the same-file/cross-file SCRIPT-FUNCTION tiers apply here.
+    //
+    // Calling convention: push PreCodePos + args LEFT-TO-RIGHT (identical to
+    // EmitCall), then push the RECEIVER expression LAST, so it is on TOP of
+    // the stack for OP_ScriptMethodCall/OP_ScriptMethodThreadCall's pop
+    // (Architecture facts 2/6) -- the callee's own prologue then sees
+    // exactly the same [PreCodePos, arg1..argN] shape an ordinary call
+    // would leave.
+    //
+    // `argsHost`/`argsStart`: the call's arguments live as a slice of some
+    // node's children (MethodCallExpr: children[1..]; the wrapped call
+    // node's own children[0..] for the threaded form) -- passed this way
+    // rather than materialized as a copy, since KisakAstNode::children is a
+    // vector<unique_ptr>, not copyable.
+    bool EmitMethodCallLike(const KisakAstNode& receiver, const std::string& funcName,
+                            const std::vector<std::string>& pathSegments,
+                            const KisakAstNode& argsHost, size_t argsStart,
+                            uint32_t line, bool threaded) {
+        Op op = threaded ? Op::OP_ScriptMethodThreadCall : Op::OP_ScriptMethodCall;
+        if (pathSegments.empty()) {
+            if (!functionNames.count(funcName)) {
+                if (locals.Has(funcName)) {
+                    // Real GSC has no receiver-rebinding call-through-pointer
+                    // syntax, and this port's OP_ScriptMethodCallPointer/
+                    // OP_ScriptMethodThreadCallPointer are deliberately
+                    // unimplemented (Step 2) -- reject with a specific
+                    // message rather than a generic "unknown function"
+                    // (mirrors EmitCall's own threaded-local-pointer
+                    // rejection above).
+                    Error(line, "'" + funcName + "(...)' through a local function-pointer "
+                                "variable, used as an object-prefixed call target, is not "
+                                "supported (no method-call-through-pointer opcode exists in "
+                                "this port) — call a same-file script function by name instead");
+                    return true;
+                }
+                Error(line, "unknown function '" + funcName + "' for object-prefixed call "
+                            "(method-call syntax only resolves same-file/cross-file script "
+                            "functions in this port -- no builtin tier, matching real GSC's "
+                            "own restriction that a receiver always binds to a script "
+                            "function, never a builtin)");
+                return true;
+            }
+        } else if (!crossFixups) {
+            Error(line, "namespaced object-prefixed call '" + JoinBackslash(pathSegments) + "::" +
+                        funcName + "(...)' needs a cross-file compile session "
+                        "(CompileGscZoneEntryPoint); single-file compilation cannot resolve "
+                        "a reference into another file");
+            return true;
+        }
+        EmitOp(Op::OP_PreScriptCall);
+        for (size_t i = argsStart; i < argsHost.children.size(); ++i) {
+            if (argsHost.children[i]) EmitExpression(*argsHost.children[i]);
+            else { EmitOp(Op::OP_GetUndefined); }
+        }
+        EmitExpression(receiver);   // receiver LAST -- on top for the opcode's pop
+        EmitOp(op);
+        size_t at = here();
+        EmitU32(0);
+        if (pathSegments.empty()) {
+            callFixups.push_back({at, funcName, curFunction ? *curFunction : "", line});
+        } else {
+            std::string canonical = CanonicalGscName(pathSegments);
+            std::string qualified = canonical + "::" + funcName;
+            crossFixups->push_back({at, qualified, curCanonical ? *curCanonical : "",
+                                    curFunction ? *curFunction : "", line});
+            precache->push_back(canonical);
+        }
+        return true;
+    }
+
     // Path segments as written in .gsc source use backslash; kept only for
     // human-facing error messages (`maps\_blackhawk::main`).
     static std::string JoinBackslash(const std::vector<std::string>& segments) {
@@ -695,6 +832,31 @@ struct Compiler {
                 EmitOp(Op::OP_wait);
                 break;
             }
+            // Entity/object-model blueprint step 4: `<expr> thread <call>;`
+            // (killhouse.gsc:221/cargoship_extract.gsc:172's shared
+            // `level thread maps\<file>::main();` blocker). children[0] =
+            // receiver, children[1] = the call being threaded (a plain
+            // CallExpr or NamespacedCallExpr from the pre-existing call
+            // grammar -- its own .stringList is empty for a bareword call,
+            // non-empty for a namespaced one, so EmitMethodCallLike doesn't
+            // need to branch on call.kind at all). Same trailing-OP_DecTop
+            // discard mechanism as bare ThreadCallStatement above.
+            case Kind::MethodThreadCallStatement: {
+                if (n.children.size() != 2 || !n.children[0] || !n.children[1]) {
+                    Error(n.line, "malformed object-prefixed thread statement"); break;
+                }
+                const KisakAstNode& receiver = *n.children[0];
+                const KisakAstNode& call = *n.children[1];
+                if (call.kind != Kind::CallExpr && call.kind != Kind::NamespacedCallExpr) {
+                    Error(n.line, "malformed object-prefixed thread statement (call target "
+                                  "must be a function call)");
+                    break;
+                }
+                bool produced = EmitMethodCallLike(receiver, call.text, call.stringList,
+                                                   call, /*argsStart=*/0, n.line, /*threaded=*/true);
+                if (produced) EmitOp(Op::OP_DecTop);
+                break;
+            }
             default:
                 Error(n.line, "cannot compile statement node " + DescribeAstNodeKind(n.kind));
                 break;
@@ -709,6 +871,48 @@ struct Compiler {
         if (produced) EmitOp(Op::OP_DecTop);
     }
 
+    // Entity/object-model blueprint step 4: auto-vivification for
+    // `<fieldBase>.<fieldName>[key] = value` when the field has never been
+    // written (real corpus: cargoship_extract.gsc:10, the FIRST statement of
+    // main(): `level.fogvalue["near"] = 100;`, with no preceding
+    // `level.fogvalue = [];`). CORRECTED BY ADVERSARIAL REVIEW: real GSC
+    // auto-creates the array on first indexed write to an unset field, and
+    // this port's existing array machinery does NOT do that "for free" --
+    // an earlier draft of this plan wrongly assumed it did. Implemented
+    // entirely with EXISTING opcodes (no new opcode IDs): read the field,
+    // test it with the already-implemented isdefined() builtin, and if
+    // undefined, establish a field ref and store a fresh empty array
+    // through it. The caller (EmitAssignment's ArrayIndexExpr branch) then
+    // does its OWN, separate, ordinary field read afterward (via the
+    // unchanged EmitExpression(FieldAccessExpr) path) to obtain the
+    // now-guaranteed-Array value -- this function only handles the
+    // conditional creation, not the final read.
+    //
+    // `fieldBase` is evaluated TWICE here (once for the test read, once for
+    // the vivify-write's ref) plus a THIRD time by the caller's own final
+    // read afterward. This is only correct because every real use is
+    // self/level/game (a keyword reference, idempotent and side-effect-free
+    // to re-evaluate per Step 1's singleton design) -- documented here as
+    // the scope this relies on, not assumed silently.
+    void EmitFieldArrayAutoVivify(const KisakAstNode& fieldBase, const std::string& fieldName,
+                                  uint32_t line) {
+        int isdefinedIdx = KisakScriptFindBuiltinIndex("isdefined");
+        if (isdefinedIdx < 0) {
+            Error(line, "internal: 'isdefined' builtin missing (needed for field-array "
+                        "auto-vivification)");
+            return;
+        }
+        uint16_t fieldId = InternString(fieldName);
+        EmitFieldReadRaw(fieldBase, fieldId);           // [fieldVal]
+        EmitOp(Op::OP_CallBuiltin1);
+        EmitU16(static_cast<uint16_t>(isdefinedIdx));    // pops fieldVal, pushes 0/1 [isDefinedFlag]
+        size_t jTrueAt = EmitJumpOnTruePlaceholder();    // already defined -> skip vivify block
+        EmitFieldRef(fieldBase, fieldId);                // establishes ref, pops a fresh obj eval
+        EmitOp(Op::OP_EmptyArray);                        // [emptyArr]
+        EmitOp(Op::OP_SetVariableField);                  // writes through the ref, pops emptyArr
+        PatchForward16(jTrueAt, line);
+    }
+
     void EmitAssignment(const KisakAstNode& n) {
         if (n.children.size() != 2 || !n.children[0] || !n.children[1]) {
             Error(n.line, "malformed assignment"); return;
@@ -716,8 +920,38 @@ struct Compiler {
         const KisakAstNode& target = *n.children[0];
         const KisakAstNode& value = *n.children[1];
         if (target.kind == Kind::FieldAccessExpr) {
-            Error(n.line, "field assignment '." + target.text + "' needs an entity/object model: " +
-                          std::string(kEntityDeferred));
+            // Entity/object-model blueprint step 4: field write
+            // (Architecture fact 5). Reuses the existing
+            // OP_EvalFieldVariableRef + OP_SetVariableField dispatch
+            // (Step 1) -- no new setter opcode.
+            if (target.children.empty() || !target.children[0]) {
+                Error(n.line, "malformed field access"); return;
+            }
+            uint16_t fieldId = InternString(target.text);
+            EmitFieldRef(*target.children[0], fieldId);   // establishes ref, pops obj
+            if (n.text.empty()) {
+                EmitExpression(value);
+            } else {
+                // Compound `v OP= expr` on a field (real corpus:
+                // cargoship_extract.gsc:2860, `self.baseaccuracy *= .8;`) --
+                // re-read through a SEPARATE field read (the ref established
+                // above persists on the frame across this, unaffected),
+                // apply the operator, leave the result on top for
+                // OP_SetVariableField below. Safe to re-evaluate the base a
+                // second time here -- unlike the array-element compound-
+                // assign scope cut below, there is no runtime-evaluated KEY
+                // expression for a plain field access to double-evaluate;
+                // the field name is a compile-time constant.
+                EmitFieldReadRaw(*target.children[0], fieldId);   // [curVal]
+                EmitExpression(value);                             // [curVal, rhs]
+                Op op;
+                std::string base = n.text.substr(0, 1);
+                if (!BinaryOpcode(base, op)) {
+                    Error(n.line, "unsupported compound assignment '" + n.text + "'"); return;
+                }
+                EmitOp(op);
+            }
+            EmitOp(Op::OP_SetVariableField);
             return;
         }
         // Arrays blueprint (plans/android-gscript-arrays.md) step 3: an
@@ -743,10 +977,27 @@ struct Compiler {
                               "corpus uses it); use a plain '=' assignment instead");
                 return;
             }
+            // Entity/object-model blueprint step 4: if the base is a field
+            // access (`level.fogvalue[key] = v`), auto-vivify an empty array
+            // into that field FIRST when it's currently unset (real corpus:
+            // cargoship_extract.gsc:10, `level.fogvalue["near"] = 100;`,
+            // the corpus's own headline auto-vivification case -- see
+            // EmitFieldArrayAutoVivify's own comment for why this is
+            // genuinely new work, not something the existing array
+            // machinery already handled for free).
+            if (target.children[0]->kind == Kind::FieldAccessExpr) {
+                const KisakAstNode& fa = *target.children[0];
+                if (fa.children.empty() || !fa.children[0]) {
+                    Error(n.line, "malformed field access"); return;
+                }
+                EmitFieldArrayAutoVivify(*fa.children[0], fa.text, n.line);
+            }
             // Emit the base through the SAME EmitExpression path every other
             // expression takes — so a FieldAccessExpr base (`level.x[0] = v`)
-            // still correctly hits EmitExpression's entity-deferred rejection
-            // rather than slipping past it via a shortcut.
+            // now correctly resolves to a real field read (Step 4's own
+            // EmitExpression::FieldAccessExpr codegen above), guaranteed to
+            // be an Array by the auto-vivification just above when it
+            // wasn't already.
             EmitExpression(*target.children[0]);   // base -> array on stack
             EmitExpression(*target.children[1]);   // key on top
             EmitOp(Op::OP_EvalArrayRef);
