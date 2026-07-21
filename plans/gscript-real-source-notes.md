@@ -610,3 +610,60 @@ appears, independent of the whole-file parse-gating behavior above:
   key AND inserting a brand-new one, both visible in the caller's own
   reference to the same array) — confirmed end-to-end, not just at the
   unit level from step 1.
+
+## Addendum — threading blueprint (`plans/android-gscript-threading.md`), step 4 findings
+
+Re-ran the same 3 real levels (killhouse, bog_a, cargoship) through the full
+pipeline after steps 1-3 landed. As predicted in the plan's own Objective
+section, this is a genuine, measured mixed result — not a uniform "all
+three advance the same way":
+
+| Level | Pre-threading failure | Post-threading failure | Delta |
+|---|---|---|---|
+| killhouse | line 221, `level thread maps\killhouse_amb::main();` | **UNCHANGED, line 221, same construct** | Correctly unmoved — object-prefixed thread is out of this plan's scope, exactly as predicted |
+| bog_a | line 89, `thread debug_player_damage();` | line 106, `/#` | +17 lines; a **genuinely NEW, previously uncatalogued gap** |
+| cargoship | line 158, `thread maps\_pipes::main();` | line 172, `level thread maps\cargoship_amb::main();` | +14 lines; lands on the **SAME object-prefixed thread construct as killhouse** |
+| hunted | line 5, `#`-directive | unchanged | No change — correct, unrelated to threading |
+
+**bog_a's new blocker is a real discovery, not a variant of anything
+already tracked**: `/#` at line 106, followed by real content that
+confirms it (killhouse/bog_a/cargoship all use `array_thread`, a plain
+function call already supported by this grammar, as ordinary syntax — but
+here it's wrapped):
+```
+106: 	/#
+107: 	array_thread( getaiarray(), ::debug_pain );
+108: 	array_thread( getspawnerarray(), ::add_spawn_function, ::debug_pain );
+109: 	#/
+```
+This is real COD4 GSC's **debug-block delimiter** — `/# ... #/` brackets
+code that's only compiled in when a debug/AI-debug build flag is set (the
+bracketed content here is exactly the kind of thing that fits: AI pain-
+debugging hooks). This port's lexer currently tokenizes `/` and `#`
+separately (division operator + directive-start), so `/#` parses as two
+tokens, not the paired debug-block delimiter retail's real grammar
+treats it as — a lex/parse-level gap, not previously identified in any
+of the four blueprints' own research phases. **Flagged here explicitly
+for whoever updates `gscript-vm-gaps.md` (step 5) or plans a future
+blueprint**: this needs its own entry, likely a fairly mechanical lexer/
+parser fix (skip the bracketed block, similar in spirit to how
+`#include` is parsed-and-dropped today) rather than a new subsystem, but
+it was NOT anticipated by any prior research pass.
+
+**cargoship converging on killhouse's exact next gap (object-prefixed
+`thread`) is a useful, confirming signal**: two of the three real levels
+now hit the identical construct as their next blocker, reinforcing that
+object-prefixed thread (needing a real `self`-binding mechanism, deferred
+to the entity/object-model blueprint per this plan's own scope cut) is
+genuinely the highest-value NEXT target for those two scripts
+specifically — while bog_a's own next blocker (`/#` debug blocks) is
+architecturally unrelated to the entity model entirely, and could
+plausibly be picked up as a small, independent fix well before the
+entity-model blueprint lands, if a future session wants an easy, isolated
+win.
+
+Isolated real-corpus thread/wait snippets were already thoroughly
+validated in step 3's own host test (not repeated here): bog_a.gsc:89
+(bare, no args), cargoship.gsc:158 (bare, namespaced, cross-file target),
+killhouse.gsc:390 (namespaced thread WITH an argument, an array correctly
+passed through) — all compile and execute correctly end to end.
