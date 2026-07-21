@@ -730,3 +730,48 @@ blueprint's changes are real (Step 4's own isolated `self set_force_color(
 whole-file compile progress, since `/#` sits earlier in the file than any
 construct this blueprint touches. No regression, no missed opportunity —
 just confirmation that this file's bottleneck lies elsewhere.
+
+## Addendum — switch/loop-control blueprint (`plans/android-gscript-switch-control-flow.md`), step 4 findings
+
+Re-ran all 4 real levels through the same real fastfile+rawfile+cross-file-
+compiler pipeline (`step10_multilevel/test_multilevel_crossfile.cpp`,
+extended in the entity-model blueprint's own step 5 to include killhouse
+alongside cargoship/bog_a/hunted), after switch/case/default/break/continue
+moved from "not covered" to "covered" above. The plan's own headline claim
+— that cargoship's real line-189 `switch` blocker would resolve — is
+confirmed precisely:
+
+| Level | Pre-switch-blueprint failure | Post-switch-blueprint failure | Delta |
+|---|---|---|---|
+| killhouse | line 371, `level waittill ( "mission failed" );` | **UNCHANGED, line 371, same construct** | No change — correct, this blueprint never touches `waittill`/`notify`/`endon` |
+| cargoship | line 189, `switch(level.jumptosection) { ... }` | **line 202**, `#using_animtree("generic_human");` | **+13 lines** — the switch statement (lines 189-198) now compiles cleanly end to end; the new blocker is NOT a new discovery, it's the SAME already-documented `#using_animtree`/other-`#`-directive gap `hunted.gsc:5` already hits (see the "Not covered" table's own row for it — this port's `SkipIncludeDirective` only recognizes `#include`, nothing else) |
+| bog_a | line 106, `/#` | **UNCHANGED, line 106, same construct** | No change — correct, `/#` sits earlier in the file than any construct this blueprint touches (confirmed separately: bog_a's own real continue-in-for-loop idiom, isolated below, compiles and executes correctly) |
+| hunted | line 5, `#using_animtree(...)` | Unchanged, line 5, same construct | No change — correct, unrelated to switch/loop-control; interesting only in that cargoship's NEW blocker (above) is now literally the identical construct as hunted's own long-standing one |
+
+**cargoship's real switch statement (lines 189-198) is confirmed fully
+resolved, not just "the file advanced past it by coincidence"**: the new
+failure point (line 202) is 4 lines PAST the switch's own closing `}`
+(line 199) and 3 lines past a blank line and a comment boundary — there is
+no construct between the switch and the new blocker that could account for
+the advance instead. This is the direct, concrete confirmation of Step 3's
+own correctness (the split-dispatch fallthrough fix).
+
+**bog_a's own real `continue;`-in-a-for-loop idiom, isolated** (bog_a_
+extract.gsc:613-619's exact shape: `for (i=0; i<array.size; i++) { v =
+array[i]; if (badCondition) continue; ...accumulate...; }`) — every real
+site in bog_a entangles `continue` with at least one OTHER, unrelated
+out-of-scope construct at the same line (`isalive()`/`dodamage()` are
+retail entity-builtin-methods, explicitly out of scope per the entity-
+model blueprint's own Scope Cut item 2; the vector literal `(0,0,0)` is
+also explicitly out of scope, per the "Not covered" table's own Vectors
+row) — so a byte-for-byte copy of any real line would fail for reasons
+having nothing to do with this blueprint. Isolated with the SAME real
+structure (array-indexed for-loop, `if (condition) continue;`, running
+accumulation) but in-scope substitutes for the entangled builtins/method
+call/vector: `values = []; values[0]=1; values[1]=-1; values[2]=2;
+values[3]=-3; values[4]=4; sum=0; for(i=0;i<values.size;i++){ v=values[i];
+if(v<0) continue; sum+=v; }` — compiles cleanly and executes to
+`sum==7` (1+2+4, correctly skipping both negative values), confirming
+bog_a's real, common continue-in-a-loop idiom works correctly end to end
+even though the file's own whole-file compile progress can't visibly
+demonstrate it (blocked earlier, at line 106, by the unrelated `/#` gap).
