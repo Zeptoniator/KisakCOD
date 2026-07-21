@@ -453,7 +453,22 @@ struct Compiler {
         return true;
     }
 
-    bool EmitCall(const KisakAstNode& n) {
+    // Threading blueprint (plans/android-gscript-threading.md) step 3:
+    // `threaded` parameterizes which opcode the same-file/cross-file script-
+    // call tier emits (OP_ScriptThreadCall vs. OP_ScriptFunctionCall) — the
+    // ONE thing that differs between a plain call and `thread <call>;`
+    // targeting the SAME callee resolution. Defaults to false so every
+    // existing call site (ordinary CallExpr/NamespacedCallExpr emission)
+    // is unaffected. The builtin tier never changes behavior for `threaded`
+    // — real GSC never threads a builtin (confirmed: no real corpus usage
+    // does; builtins are always synchronous engine calls in retail too, so
+    // there is no distinct "threaded builtin" semantics to model even if it
+    // occurred) — it always compiles the same way regardless. The local-
+    // FunctionRef-pointer tier has no threaded equivalent at all
+    // (OP_ScriptThreadCallPointer is deliberately unimplemented per step 1)
+    // and is rejected with a specific error when threaded=true, rather than
+    // silently emitting the wrong (non-threaded) opcode.
+    bool EmitCall(const KisakAstNode& n, bool threaded = false) {
         int builtin = KisakScriptFindBuiltinIndex(n.text);
         uint32_t argc = static_cast<uint32_t>(n.children.size());
         if (builtin >= 0) {
@@ -485,20 +500,31 @@ struct Compiler {
                 if (n.children[i]) EmitExpression(*n.children[i]);
                 else { EmitOp(Op::OP_GetUndefined); }
             }
-            EmitOp(Op::OP_ScriptFunctionCall);
+            EmitOp(threaded ? Op::OP_ScriptThreadCall : Op::OP_ScriptFunctionCall);
             size_t at = here();
             EmitU32(0);
             callFixups.push_back({at, n.text, curFunction ? *curFunction : "", n.line});
             return true;
         }
         if (locals.Has(n.text)) {
-            // Step 3's third tier: call through a local variable that may
-            // hold a FunctionRef at runtime (see decision #2 above for why
-            // bare `name()` is allowed to mean this — a deliberate
-            // simplification, not real GSC's `[[ expr ]]` syntax). Args
-            // LEFT-TO-RIGHT same as a direct script call, then the
-            // function-pointer expression is evaluated LAST so its value
-            // is on TOP of stack when OP_ScriptFunctionCallPointer pops it.
+            if (threaded) {
+                // Threading blueprint step 3: no OP_ScriptThreadCallPointer
+                // exists (deliberately unimplemented, step 1) -- reject
+                // rather than silently emit the non-threaded pointer call.
+                Error(n.line, "'thread " + n.text + "(...)' through a local function-pointer "
+                              "variable is not supported (no threaded-call-through-pointer "
+                              "opcode exists in this port) — call it directly instead of "
+                              "threading it, or thread the same-named function itself");
+                return true;
+            }
+            // Step 3's (namespaced-calls blueprint) third tier: call through
+            // a local variable that may hold a FunctionRef at runtime (see
+            // decision #2 above for why bare `name()` is allowed to mean
+            // this — a deliberate simplification, not real GSC's
+            // `[[ expr ]]` syntax). Args LEFT-TO-RIGHT same as a direct
+            // script call, then the function-pointer expression is
+            // evaluated LAST so its value is on TOP of stack when
+            // OP_ScriptFunctionCallPointer pops it.
             EmitOp(Op::OP_PreScriptCall);
             for (uint32_t i = 0; i < argc; ++i) {
                 if (n.children[i]) EmitExpression(*n.children[i]);
@@ -522,8 +548,10 @@ struct Compiler {
     // is cross-file: inside a cross-file session, emit a direct script call to
     // the qualified target (a CrossFileFixup links it — see below); outside
     // one, it is a compile error (nothing else to search).
-    bool EmitNamespacedCall(const KisakAstNode& n) {
-        if (n.stringList.empty()) return EmitCall(n);
+    // `threaded`: see EmitCall's own comment — same parameterization,
+    // threaded through to EmitCall for the empty-path (same-file) case.
+    bool EmitNamespacedCall(const KisakAstNode& n, bool threaded = false) {
+        if (n.stringList.empty()) return EmitCall(n, threaded);
         if (!crossFixups) {
             Error(n.line, "namespaced call '" + JoinBackslash(n.stringList) + "::" + n.text +
                           "(...)' needs a cross-file compile session "
@@ -535,13 +563,17 @@ struct Compiler {
         // emits the identical OP_ScriptFunctionCall) — only the fixup differs:
         // caller pushes a PreCodePos delimiter, args LEFT-TO-RIGHT, then the
         // 4-byte codepos operand is backpatched to the qualified target.
+        // `threaded` swaps in OP_ScriptThreadCall the same way EmitCall's
+        // same-file tier does — a cross-file namespaced target can be
+        // threaded exactly like a same-file one (killhouse.gsc's own
+        // `thread maps\_introscreen::introscreen_feed_lines(lines);`).
         EmitOp(Op::OP_PreScriptCall);
         uint32_t argc = static_cast<uint32_t>(n.children.size());
         for (uint32_t i = 0; i < argc; ++i) {
             if (n.children[i]) EmitExpression(*n.children[i]);
             else { EmitOp(Op::OP_GetUndefined); }
         }
-        EmitOp(Op::OP_ScriptFunctionCall);
+        EmitOp(threaded ? Op::OP_ScriptThreadCall : Op::OP_ScriptFunctionCall);
         RecordCrossFileFixup(n);
         return true;
     }
@@ -632,6 +664,37 @@ struct Compiler {
             case Kind::WhileStatement: EmitWhile(n); break;
             case Kind::ForStatement: EmitFor(n); break;
             case Kind::ReturnStatement: EmitReturn(n); break;
+            // Threading blueprint (plans/android-gscript-threading.md) step
+            // 3: `thread <call>;` -- emit the SAME argument-evaluation
+            // sequence an ordinary call to the same target would use
+            // (EmitCall/EmitNamespacedCall, threaded=true swaps in
+            // OP_ScriptThreadCall), then discard the (per real GSC, always
+            // unused) return value with a trailing OP_DecTop -- mirroring
+            // EmitExprClause's existing discard pattern exactly. This is
+            // step 1's already-resolved design: OP_ScriptThreadCall has no
+            // hook to discard its own result (the callee hasn't run yet at
+            // its own dispatch site), so the compiler must do it here.
+            case Kind::ThreadCallStatement: {
+                if (n.children.empty() || !n.children[0]) {
+                    Error(n.line, "malformed thread statement"); break;
+                }
+                const KisakAstNode& call = *n.children[0];
+                bool produced = (call.kind == Kind::NamespacedCallExpr)
+                    ? EmitNamespacedCall(call, /*threaded=*/true)
+                    : EmitCall(call, /*threaded=*/true);
+                if (produced) EmitOp(Op::OP_DecTop);
+                break;
+            }
+            // `wait <expr>;` -- emit the duration, then OP_wait (validates
+            // type/range, documented no-op otherwise — step 1).
+            case Kind::WaitStatement: {
+                if (n.children.empty() || !n.children[0]) {
+                    Error(n.line, "malformed wait statement"); break;
+                }
+                EmitExpression(*n.children[0]);
+                EmitOp(Op::OP_wait);
+                break;
+            }
             default:
                 Error(n.line, "cannot compile statement node " + DescribeAstNodeKind(n.kind));
                 break;
