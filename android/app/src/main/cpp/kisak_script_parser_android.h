@@ -63,6 +63,30 @@ enum class KisakAstNodeKind : uint8_t {
     ForStatement,          // children[0] = init (optional), children[1] = condition (optional), children[2] = increment (optional), children[3] = body
     ReturnStatement,       // children[0] = expr (optional)
     ExpressionStatement,   // children[0] = expr
+    // Switch/loop-control blueprint (plans/android-gscript-switch-control-
+    // flow.md), step 1. children[0] = subject expression; remaining
+    // children = CaseClause nodes, in source order.
+    SwitchStatement,
+    // isDefault = true for a `default:` clause. If !isDefault: children[0]
+    // = the case's literal value (an IntLiteralExpr or StringLiteralExpr
+    // node, reusing those existing kinds rather than duplicating a type
+    // tag on this node -- matches every real corpus example, a plain int
+    // or string literal only), children[1..] = the clause's own statement
+    // list. If isDefault: children[0..] = the statement list directly (no
+    // value node -- there is nothing to compare). Either way the statement
+    // list is FLAT (not wrapped in an extra Block node, even if the source
+    // used a brace block) -- matches how FunctionDef's own body is a flat
+    // statement list under one Block, keeping DumpAst and the compiler's
+    // own emission simple.
+    CaseClause,
+    // No children, no text. Compile error if used outside any enclosing
+    // loop or switch (a compiler-level check, not a parser-level one --
+    // the parser accepts a bare `break;`/`continue;` anywhere a statement
+    // is expected, exactly like `return;`).
+    BreakStatement,
+    // No children, no text. Compile error if used outside any enclosing
+    // loop (switches have no continue target of their own).
+    ContinueStatement,
     // Threading blueprint (plans/android-gscript-threading.md) step 2. Bare
     // `thread funcName(args);` / `thread path\file::func(args);` — no
     // object prefix (object-prefixed `<expr> thread ...` is explicitly out
@@ -152,6 +176,11 @@ struct KisakAstNode {
     std::vector<std::string> stringList;  // FunctionDef's parameter names,
                                            // or NamespacedCallExpr/FunctionRefExpr's path segments
     std::vector<std::unique_ptr<KisakAstNode>> children;
+    // CaseClause only: true for a `default:` clause, in which case
+    // text/intValue are meaningless and must not be read (there is no
+    // literal value to compare against — a default clause is reached only
+    // when every other case's comparison fails).
+    bool isDefault = false;
 
     explicit KisakAstNode(KisakAstNodeKind k, uint32_t ln) : kind(k), line(ln) {}
 };

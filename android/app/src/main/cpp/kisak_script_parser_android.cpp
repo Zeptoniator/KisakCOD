@@ -199,7 +199,123 @@ private:
         // clear "expected ';'"-style error, not a crash or silent misparse).
         if (CheckKeyword(KisakScriptKeyword::Thread)) return ParseThreadCall();
         if (CheckKeyword(KisakScriptKeyword::Wait)) return ParseWait();
+        // Switch/loop-control blueprint (plans/android-gscript-switch-
+        // control-flow.md) step 1. `break`/`continue` are trivial no-
+        // expression statements (mirroring ParseReturn's own shape) --
+        // whether they're actually inside a loop/switch is a COMPILER-level
+        // check (Architecture fact 4), not a parser-level one, exactly like
+        // every other semantic (non-grammatical) rejection in this port.
+        if (CheckKeyword(KisakScriptKeyword::Switch)) return ParseSwitch();
+        if (CheckKeyword(KisakScriptKeyword::Break)) {
+            uint32_t line = CurLine();
+            Advance();
+            auto node = MakeNode(Kind::BreakStatement, line);
+            ExpectOp(";");
+            return node;
+        }
+        if (CheckKeyword(KisakScriptKeyword::Continue)) {
+            uint32_t line = CurLine();
+            Advance();
+            auto node = MakeNode(Kind::ContinueStatement, line);
+            ExpectOp(";");
+            return node;
+        }
         return ParseExpressionOrAssignmentStatement();
+    }
+
+    // Switch/loop-control blueprint step 1: `switch (subject) { case V: ...;
+    // default: ...; }`. Real corpus confirms BOTH string- and integer-cased
+    // switches (cargoship_extract.gsc:189, ally_sas_woodland_smg_mp5.gsc:26),
+    // an optional `default:` clause (cargoship_extract.gsc:715, always last
+    // in the real corpus but the grammar doesn't assume that), and case
+    // bodies with or without a brace block (cargoship_extract.gsc:1765/249).
+    std::unique_ptr<KisakAstNode> ParseSwitch() {
+        uint32_t line = CurLine();
+        Advance();  // 'switch'
+        auto node = MakeNode(Kind::SwitchStatement, line);
+        if (!ExpectOp("(")) return node;
+        auto subject = ParseExpression();
+        if (subject) node->children.push_back(std::move(subject));
+        if (!ExpectOp(")")) return node;
+        if (!ExpectOp("{")) return node;
+        while (!failed_ && !AtEnd() && !CheckOp("}")) {
+            auto clause = ParseCaseClause();
+            if (failed_) return node;
+            if (clause) node->children.push_back(std::move(clause));
+        }
+        ExpectOp("}");
+        return node;
+    }
+
+    // A single `case <literal>:` or `default:` clause header, followed by a
+    // flat run of ordinary statements (via the SAME ParseStatement() loop
+    // ParseBlock itself uses) until the next `case`/`default`/`}` token.
+    // children[0] (non-default only) = the case's literal value node
+    // (IntLiteralExpr/StringLiteralExpr, reusing those existing kinds
+    // rather than a duplicate type tag); the rest = the statement list.
+    std::unique_ptr<KisakAstNode> ParseCaseClause() {
+        uint32_t line = CurLine();
+        auto clause = MakeNode(Kind::CaseClause, line);
+        if (MatchKeyword(KisakScriptKeyword::Default)) {
+            clause->isDefault = true;
+            if (!ExpectOp(":")) return clause;
+        } else if (MatchKeyword(KisakScriptKeyword::Case)) {
+            auto value = ParseCaseValue();
+            if (failed_) return clause;
+            clause->children.push_back(std::move(value));
+            if (!ExpectOp(":")) return clause;
+        } else {
+            Fail("expected 'case' or 'default' inside switch body, got " +
+                 (AtEnd() ? "end of input" : "'" + Peek().text + "'"));
+            return clause;
+        }
+        while (!failed_ && !AtEnd() && !CheckKeyword(KisakScriptKeyword::Case) &&
+               !CheckKeyword(KisakScriptKeyword::Default) && !CheckOp("}")) {
+            if (CheckOp("{")) {
+                // Splice a brace block's statements FLAT into the clause
+                // (matching real corpus shape, e.g. cargoship_extract.gsc:
+                // 1765's `case "hallways": { ... }`) -- keeps CaseClause's
+                // children a flat statement list (Architecture fact 1), not
+                // wrapped in an extra Block node, even though EmitStatement
+                // would actually handle a nested Block correctly too (this
+                // port's locals are function-scoped, not block-scoped) --
+                // flattening here is purely for a cleaner, more direct AST,
+                // not a correctness requirement.
+                auto block = ParseBlock();
+                if (failed_) return clause;
+                if (block) {
+                    for (auto& child : block->children) {
+                        clause->children.push_back(std::move(child));
+                    }
+                }
+                continue;
+            }
+            auto stmt = ParseStatement();
+            if (failed_) return clause;
+            if (stmt) clause->children.push_back(std::move(stmt));
+        }
+        return clause;
+    }
+
+    // A case label: a plain int or string literal ONLY (matching every
+    // real corpus example -- see the plan's own scope cut). Anything else
+    // (a computed expression, an identifier, ...) is a specific, clear
+    // parse error, not silently accepted.
+    std::unique_ptr<KisakAstNode> ParseCaseValue() {
+        uint32_t line = CurLine();
+        if (!AtEnd() && Peek().type == KisakScriptTokenType::IntLiteral) {
+            auto node = MakeNode(Kind::IntLiteralExpr, line);
+            node->intValue = Advance().intValue;
+            return node;
+        }
+        if (!AtEnd() && Peek().type == KisakScriptTokenType::StringLiteral) {
+            auto node = MakeNode(Kind::StringLiteralExpr, line);
+            node->text = Advance().stringValue;
+            return node;
+        }
+        Fail("case label must be a plain int or string literal, got " +
+             (AtEnd() ? "end of input" : "'" + Peek().text + "'"));
+        return MakeNode(Kind::UndefinedLiteralExpr, line);
     }
 
     // Threading blueprint step 2: `thread <call-expr>;`. `thread` is purely
@@ -760,6 +876,10 @@ std::string DescribeAstNodeKind(KisakAstNodeKind kind) {
         case Kind::ForStatement: return "ForStatement";
         case Kind::ReturnStatement: return "ReturnStatement";
         case Kind::ExpressionStatement: return "ExpressionStatement";
+        case Kind::SwitchStatement: return "SwitchStatement";
+        case Kind::CaseClause: return "CaseClause";
+        case Kind::BreakStatement: return "BreakStatement";
+        case Kind::ContinueStatement: return "ContinueStatement";
         case Kind::ThreadCallStatement: return "ThreadCallStatement";
         case Kind::WaitStatement: return "WaitStatement";
         case Kind::Assignment: return "Assignment";
@@ -791,6 +911,7 @@ std::string DumpAst(const KisakAstNode& node, int indent) {
     if (!node.text.empty()) out += " '" + node.text + "'";
     if (node.kind == KisakAstNodeKind::IntLiteralExpr) out += " " + std::to_string(node.intValue);
     if (node.kind == KisakAstNodeKind::FloatLiteralExpr) out += " " + std::to_string(node.floatValue);
+    if (node.kind == KisakAstNodeKind::CaseClause && node.isDefault) out += " default";
     if (node.kind == KisakAstNodeKind::BoolLiteralExpr) out += node.intValue ? " true" : " false";
     if (!node.stringList.empty()) {
         bool isPath = node.kind == KisakAstNodeKind::NamespacedCallExpr ||
